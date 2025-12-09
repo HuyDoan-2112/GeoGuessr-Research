@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Street View Navigator</title>
+    <style>#pano-container { width: 70%; height: 100vh; float: left; }
+           #side-panel { width: 30%; height: 100vh; float: left; padding: 8px; box-sizing: border-box; }
+           #ai-output { width: 100%; height: 40vh; }
+           .move-btn {display: block; margin: 4px 0; padding: 4px 8px;}
+    </style>
+</head>
+<body>
+  <div id="pano-container"></div>
+  <div id="side-panel">
+    <button id="btn-random">Teleport Random</button>
+    <h3>Available Moves</h3>
+    <div id="moves-list"></div>
+    <h3>Observation JSON</h3>
+    <textarea id="ai-output" readonly></textarea>
+     <hr>
+
+        <!-- ========== SIMPLE FASTAPI TEST SECTION ========== -->
+        <h3>Send Observation to FastAPI Backend</h3>
+        <button id="send-step-btn">Send Step</button>
+
+        <h4>Backend Response:</h4>
+        <pre id="action-text"></pre>
+        <pre id="pano-json"></pre>
+        <img id="pano-img" style="width:200px; border:1px solid #ccc;" />
+  </div>
+  
+  <!-- Google Maps JS API -->
+  <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBorZKmYOKIfN1PB2fGg-CQKET83DvGwoA&libraries=geometry"></script>
+  <!-- Your environment script -->
+  <script src="app.js"></script>
+  <script>
+    window.onload = () => {
+      AgentEnv.init({
+        panoContainerId: 'pano-container',
+        randomButtonId: 'btn-random'
+      });
+
+      // Example: listen to updates
+      window.addEventListener('agent_observation_updated', (e) => {
+        console.log('New observation:', e.detail);
+      });
+    };
+  </script>
+</body>
+</html>
