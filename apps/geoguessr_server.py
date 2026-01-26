@@ -29,6 +29,15 @@ from core.tools import nav_tools
 from core.tools.contracts import ToolContext
 from adapters.streetview_js.client import StreetViewHostClient
 
+_SHARED_HOST_CLIENT: Optional[StreetViewHostClient] = None
+
+
+def _get_shared_client() -> StreetViewHostClient:
+    global _SHARED_HOST_CLIENT
+    if _SHARED_HOST_CLIENT is None:
+        _SHARED_HOST_CLIENT = StreetViewHostClient()
+    return _SHARED_HOST_CLIENT
+
 # ---------------------------------------------------------------------------
 # Engine State
 # ---------------------------------------------------------------------------
@@ -245,7 +254,7 @@ class Engine:
     # --- Public actions (called by Flask routes) ---
 
     def connect(self, api_key: str, session_id: Optional[str] = None) -> Dict[str, Any]:
-        client = self._host_client or StreetViewHostClient()
+        client = _get_shared_client()
         if not session_id:
             session_id = f"session_{int(time.time())}"
         client.start(session_id, api_key=api_key)
