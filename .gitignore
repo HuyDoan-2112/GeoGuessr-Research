@@ -31,17 +31,9 @@ Thumbs.db
 images/
 
 # Local tools with secrets
-agent_cli
-agent_cli.py
-multi_agent.py
 ./docs
 *.md
 ./runs
 *events.jsonl
-*gemini.py
-*claude.py
-*multi_agent_test.py
-*multi_agent_test_90.py
-*claudesnip.py
-*geminisnip.py
-*openaisnip.py
+*/test_multi_agents_hard_code
+
