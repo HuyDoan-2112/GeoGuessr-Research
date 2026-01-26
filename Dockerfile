@@ -27,4 +27,4 @@ USER pwuser
 
 ENV IMAGE_OUTPUT_DIR=/data/images
 
-CMD ["python3", "-m", "apps.runner"]
+CMD ["python3", "-m", "apps.geoguessr_server"]

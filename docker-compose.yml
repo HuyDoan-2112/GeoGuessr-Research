@@ -16,22 +16,5 @@ services:
     ports:
       - "8000:8000"
 
-  geoguessr-wrapper:
-    build:
-      context: .
-    command: ["python3", "-m", "apps.run_wrapper"]
-    stdin_open: true
-    tty: true
-    environment:
-      GOOGLE_MAPS_API_KEY: "${GOOGLE_MAPS_API_KEY}"
-      IMAGE_OUTPUT_DIR: /data/images
-      GEOGUESSR_SERVER_URL: "http://geoguessr-worker:8000"
-    volumes:
-      - geoguessr-images:/data/images
-    shm_size: "1gb"
-    restart: "no"
-    depends_on:
-      - geoguessr-worker
-
 volumes:
   geoguessr-images:
