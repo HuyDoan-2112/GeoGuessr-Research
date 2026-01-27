@@ -83,10 +83,14 @@ def check_available_moves(state_json: str) -> str:
     state = parse_state(state_json)
     current_heading = _current_heading(state)
     move_actions: List[str] = []
+    _DIR_TO_FULL = {
+        "N": "north", "NE": "northeast", "E": "east", "SE": "southeast",
+        "S": "south", "SW": "southwest", "W": "west", "NW": "northwest",
+    }
     for link in _links(state):
         move_heading = float(link["heading"])
         direction = _heading_to_direction(move_heading)
-        move_actions.append(f"move_{direction}")
+        move_actions.append(f"move_{_DIR_TO_FULL[direction]}")
     
     universal_actions = [
         "scroll_up",

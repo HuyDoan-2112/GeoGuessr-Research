@@ -27,9 +27,6 @@ def _execute_command(ctx: ToolContext, cmd: Dict[str, Any]) -> Dict[str, Any]:
     client = _get_client(ctx)
     method = cmd.get("method")
     params = cmd.get("params") or {}
-    before_state = None
-    if method in {"setPano", "setPosition"}:
-        before_state = client.get_state(ctx.session_id)
     if method == "setPov":
         client.set_pov(
             ctx.session_id,

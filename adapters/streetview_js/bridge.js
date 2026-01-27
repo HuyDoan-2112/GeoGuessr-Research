@@ -123,7 +123,7 @@
   // Return the current pano, POV, position, and links snapshot.
   async function getState() {
     if (!panorama) return null;
-    const pov = panorama.getPov() || { heading: 100, pitch: 100 };
+    const pov = panorama.getPov() || { heading: 0, pitch: 0 };
     const position = panorama.getPosition();
     const links = panorama.getLinks() || [];
     const panoId = panorama.getPano() || null;

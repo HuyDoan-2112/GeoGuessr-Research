@@ -84,7 +84,7 @@ def fetch_image(
     url = (
         "https://maps.googleapis.com/maps/api/streetview"
         f"?size={size}&pano={pano_id}"
-        f"&heading={round(h)}&pitch={round(p)}&fov={fov}"
+        f"&heading={h:.2f}&pitch={p:.2f}&fov={fov}"
         f"&key={api_key}"
     )
 
