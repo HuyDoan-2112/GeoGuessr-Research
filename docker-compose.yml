@@ -6,9 +6,9 @@ services:
       dockerfile: Dockerfile.node
     environment:
       GOOGLE_MAPS_API_KEY: "${GOOGLE_MAPS_API_KEY}"
-      POOL_SIZE: "10"
+      POOL_SIZE: "80"
       STREETVIEW_HOST_PORT: "3000"
-    shm_size: "1gb"
+    shm_size: "5gb"
     restart: "no"
     ports:
       - "3000:3000"
@@ -24,6 +24,7 @@ services:
       IMAGE_OUTPUT_DIR: /data/images
       SERVER_PORT: "8000"
       STREETVIEW_HOST_URL: "http://streetview-host:3000"
+      USE_WAITRESS: "true"
     volumes:
       - geoguessr-images:/data/images
     depends_on:

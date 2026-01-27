@@ -354,8 +354,7 @@ class GeoGuessrAPI:
     def move_southwest(self) -> Dict[str, Any]:
         """Move to the adjacent panorama in the Southwest direction.
         Returns:
-        
-             - image_path (str): Path to the captured image at the new location.
+            - image_path (str): Path to the captured image at the new location.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/southwest")

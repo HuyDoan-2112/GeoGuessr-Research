@@ -535,7 +535,7 @@ def route_zoom(direction):
 
 
 @app.route("/end_session", methods=["POST"])
-def route_end_sessio():
+def route_end_session():
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
