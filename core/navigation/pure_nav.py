@@ -40,9 +40,9 @@ def _heading_to_direction(heading: float) -> str:
 def _in_cone(h: float, cones: List[tuple[float, float]]) -> bool:
     h = _normalize_heading(h)
     for lo, hi in cones:
-        if lo <= hi and lo <= h <= hi:
+        if lo <= hi and lo <= h < hi:
             return True
-        if lo > hi and (h >= lo or h <= hi):
+        if lo > hi and (h >= lo or h < hi):
             return True
     return False
 

@@ -21,10 +21,10 @@ def setup_logging(
     if format_string is None:
         format_string = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     
-    handlers: list[logging.handler] = []
+    handlers: list[logging.Handler] = []
 
     # Console handler
-    console_handler = logging.Streamhandler(sys.stderr)
+    console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setFormatter(logging.Formatter(format_string))
     handlers.append(console_handler)
 

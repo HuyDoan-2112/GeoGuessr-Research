@@ -1,19 +1,11 @@
-"""
-GeoGuessr Navigation Server.
-
-Flask server that exposes the GeoGuessr navigation engine as REST endpoints.
-Runs inside Docker alongside Playwright/Street View.
-
-All core.*, adapters.*, and nav_tools logic lives here — the client
-wrapper (geoguessr_wrapper.py) communicates via HTTP only.
-"""
-
 import json
 import math
 import os
 import random
 import sys
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,14 +21,25 @@ from core.tools import nav_tools
 from core.tools.contracts import ToolContext
 from adapters.streetview_js.client import StreetViewHostClient
 
-_SHARED_HOST_CLIENT: Optional[StreetViewHostClient] = None
+# ---------------------------------------------------------------------------
+# Per-session locks
+# ---------------------------------------------------------------------------
+_SESSION_LOCKS: Dict[str, threading.Lock] = {}
+_LOCKS_LOCK = threading.Lock()
 
 
-def _get_shared_client() -> StreetViewHostClient:
-    global _SHARED_HOST_CLIENT
-    if _SHARED_HOST_CLIENT is None:
-        _SHARED_HOST_CLIENT = StreetViewHostClient()
-    return _SHARED_HOST_CLIENT
+def _get_session_lock(sid: str) -> threading.Lock:
+    with _LOCKS_LOCK:
+        if sid not in _SESSION_LOCKS:
+            _SESSION_LOCKS[sid] = threading.Lock()
+        return _SESSION_LOCKS[sid]
+
+
+def _drop_session(sid: str) -> None:
+    with _LOCKS_LOCK:
+        _SESSION_LOCKS.pop(sid, None)
+    engines.pop(sid, None)
+
 
 # ---------------------------------------------------------------------------
 # Engine State
@@ -44,17 +47,15 @@ def _get_shared_client() -> StreetViewHostClient:
 
 @dataclass
 class EngineState:
-    """Server-side state for the GeoGuessr navigation engine."""
+    """Server-side state for the GeoGuessr navigation engine (per-session)."""
 
     # Configuration
     random_seed: int = 42
-    image_root: str = "images"
+    image_root: str = field(default_factory=lambda: os.getenv("IMAGE_OUTPUT_DIR", "images"))
     max_steps: int = 100
     session_id: Optional[str] = None
 
-    # Episode
-    episode_id: Optional[str] = None
-    episode_active: bool = False
+    # Per-session progress
     step_count: int = 0
 
     # Navigation
@@ -84,7 +85,7 @@ class Engine:
     Server-side GeoGuessr navigation engine.
 
     Manages StreetViewHostClient, ToolContext, nav_tools execution,
-    image capture, and state tracking.
+    image capture, and state tracking (per session).
     """
 
     MOVE_TOOLS = {
@@ -148,9 +149,7 @@ class Engine:
     def _sync_image_step(self) -> None:
         if self._ctx is None:
             return
-        self.state._image_step = self._ctx.meta.get(
-            "image_step", self.state._image_step
-        )
+        self.state._image_step = self._ctx.meta.get("image_step", self.state._image_step)
 
     def _apply_tool_result(self, result) -> None:
         updates = getattr(result, "updates", {}) or {}
@@ -193,13 +192,14 @@ class Engine:
         }
 
     def _capture_image(self) -> Optional[str]:
-        if not self.state.pano_id or not self.state.episode_id:
+        # Capture is tied to session_id
+        if not self.state.pano_id or not self.state.session_id:
             return None
         try:
             state = self._build_host_state()
             path = capture_state_image(
                 state=state,
-                session_id=self.state.episode_id,
+                session_id=self.state.session_id,          # <- changed
                 root_dir=self.state.image_root,
                 step=self.state._image_step,
             )
@@ -239,7 +239,6 @@ class Engine:
 
     def _state_snapshot(self) -> Dict[str, Any]:
         return {
-            "episode_id": self.state.episode_id,
             "pano_id": self.state.pano_id,
             "lat": self.state.lat,
             "lng": self.state.lng,
@@ -254,38 +253,58 @@ class Engine:
     # --- Public actions (called by Flask routes) ---
 
     def connect(self, api_key: str, session_id: Optional[str] = None) -> Dict[str, Any]:
-        client = _get_shared_client()
+        client = StreetViewHostClient()
         if not session_id:
-            session_id = f"session_{int(time.time())}"
+            session_id = f"session_{uuid.uuid4().hex}"
         client.start(session_id, api_key=api_key)
         self._set_host_context(client, session_id)
+
+        # reset per-session counters/outputs
+        self.state.step_count = 0
+        self.state._image_step = 1
+        self.state.image_path = None
+
         return {"session_id": session_id}
 
     def load_scenario(self, scenario: Dict[str, Any]) -> Dict[str, Any]:
+        # NOTE: This keeps your behavior (setattr if exists),
+        # but you may want to whitelist keys later.
         for key, value in scenario.items():
             if hasattr(self.state, key):
                 setattr(self.state, key, value)
+
         self._random = random.Random(self.state.random_seed)
+
         if not scenario.get("image_root"):
             self.state.image_root = os.getenv("IMAGE_OUTPUT_DIR", "images")
+
         if self._ctx is not None:
             self._ctx.meta["image_root"] = self.state.image_root
             self._ctx.meta["image_step"] = self.state._image_step
+
         return {"loaded": True}
 
-    def init_panorama(self, lat: float, lng: float,
-                      heading: float = 0.0, pitch: float = 0.0,
-                      zoom: float = 1.0) -> Dict[str, Any]:
+    def init_panorama(
+        self,
+        lat: float,
+        lng: float,
+        heading: float = 0.0,
+        pitch: float = 0.0,
+        zoom: float = 1.0,
+    ) -> Dict[str, Any]:
         if not self._host_enabled():
             raise RuntimeError("Host not connected")
         ctx = self._ensure_ctx()
         result = nav_tools.init_panorama(
-            ctx, {"lat": lat, "lng": lng, "heading": heading, "pitch": pitch, "zoom": zoom},
+            ctx,
+            {"lat": lat, "lng": lng, "heading": heading, "pitch": pitch, "zoom": zoom},
         )
         if not result.ok:
             raise RuntimeError(self._tool_error(result, "init_failed"))
+
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)
+        self._pull_host_state(capture=False)   # capture already handled by nav_tools
+
         return {
             "pano_id": self.state.pano_id,
             "lat": self.state.lat,
@@ -297,89 +316,74 @@ class Engine:
             "image_path": self.state.image_path,
         }
 
-    def start_episode(self) -> Dict[str, Any]:
-        if self.state.episode_active:
-            raise RuntimeError("Episode already active")
-        episode_id = f"episode_{self._random.randint(100000, 999999)}"
-        self.state.episode_id = episode_id
-        self.state.episode_active = True
-        self.state.step_count = 1
-        self.state._image_step = 1
-        self.state.image_path = None
-        if self._host_enabled():
-            self._pull_host_state(capture=True)
-        return self._state_snapshot()
-
-    def get_episode_state(self) -> Dict[str, Any]:
-        if not self.state.episode_active:
-            raise RuntimeError("No active episode")
-        return self._state_snapshot()
-
     def move(self, direction: str) -> Dict[str, Any]:
-        if not self.state.episode_active:
-            raise RuntimeError("No active episode")
         if self.state.step_count >= self.state.max_steps:
             raise RuntimeError("Max steps reached")
+
         fn = self.MOVE_TOOLS.get(direction)
         if not fn:
             raise ValueError(f"Invalid direction: {direction}")
+
         ctx = self._ensure_ctx()
         result = fn(ctx, {})
         if not result.ok:
             raise RuntimeError(self._tool_error(result, "move_failed"))
+
         self.state.step_count += 1
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)
+        self._pull_host_state(capture=False)   # capture already handled by nav_tools
+
         return {
             "image_path": self.state.image_path,
             "available_moves": self.state.available_moves,
+            "step_count": self.state.step_count,
         }
 
     def scroll(self, direction: str, delta: float) -> Dict[str, Any]:
-        if not self.state.episode_active:
-            raise RuntimeError("No active episode")
         if delta is None or not math.isfinite(delta):
             raise ValueError("Invalid delta value")
+
         fn = self.SCROLL_TOOLS.get(direction)
         if not fn:
             raise ValueError(f"Invalid scroll direction: {direction}")
+
         ctx = self._ensure_ctx()
         result = fn(ctx, {"delta": delta})
         if not result.ok:
             raise RuntimeError(self._tool_error(result, "scroll_failed"))
+
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)
-        if not self.state.image_path:
-            raise RuntimeError("Image capture failed after scroll")
+        self._pull_host_state(capture=False)   # capture already handled by nav_tools
+
         return {"image_path": self.state.image_path}
 
     def zoom(self, direction: str, delta: float) -> Dict[str, Any]:
-        if not self.state.episode_active:
-            raise RuntimeError("No active episode")
         if delta is None or not math.isfinite(delta):
             raise ValueError("Invalid delta value")
+
         fn = self.ZOOM_TOOLS.get(direction)
         if not fn:
             raise ValueError(f"Invalid zoom direction: {direction}")
+
         ctx = self._ensure_ctx()
         result = fn(ctx, {"delta": delta})
         if not result.ok:
             raise RuntimeError(self._tool_error(result, "zoom_failed"))
+
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)
-        if not self.state.image_path:
-            raise RuntimeError("Image capture failed after zoom")
+        self._pull_host_state(capture=False)   # capture already handled by nav_tools
+
         return {"image_path": self.state.image_path}
 
-    def end_episode(self) -> Dict[str, Any]:
-        if not self.state.episode_active:
-            raise RuntimeError("No active episode")
+    def end_session(self) -> Dict[str, Any]:
+        """
+        Kept for compatibility, but this now just resets session navigation state.
+        """
         result_data = {
-            "episode_id": self.state.episode_id,
             "step_count": self.state.step_count,
         }
-        self.state.episode_id = None
-        self.state.episode_active = False
+
+        # Reset navigation state
         self.state.pano_id = None
         self.state.lat = None
         self.state.lng = None
@@ -388,15 +392,16 @@ class Engine:
         self.state.zoom = 1.0
         self.state.links = []
         self.state.available_moves = []
-        self.state.step_count = 0
         self.state.date = None
+
+        # Reset outputs/counters
         self.state.image_path = None
         self.state._image_step = 1
+        self.state.step_count = 0
+
         return result_data
 
     def check_direction(self) -> Dict[str, Any]:
-        if not self.state.episode_active:
-            raise RuntimeError("No active episode")
         ctx = self._ensure_ctx()
         result = nav_tools.check_direction(ctx, {})
         if not result.ok:
@@ -406,8 +411,6 @@ class Engine:
         return {"description": updates.get("description", "")}
 
     def check_available_moves(self) -> Dict[str, Any]:
-        if not self.state.episode_active:
-            raise RuntimeError("No active episode")
         ctx = self._ensure_ctx()
         result = nav_tools.check_available_moves(ctx, {})
         if not result.ok:
@@ -445,8 +448,11 @@ def _safe(fn, *args, **kwargs):
     try:
         data = fn(*args, **kwargs)
         return _ok(data)
+    except (ValueError, RuntimeError) as e:
+        return _err(str(e), 400)
     except Exception as e:
-        return _err(str(e))
+        app.logger.exception("Unhandled server error")
+        return _err(str(e), 500)
 
 
 @app.route("/connect", methods=["POST"])
@@ -479,31 +485,19 @@ def route_init_panorama():
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
+    sid = request.headers.get("X-Session-ID")
     body = request.get_json(force=True, silent=True) or {}
-    return _safe(
-        eng.init_panorama,
-        lat=body.get("lat", 0.0),
-        lng=body.get("lng", 0.0),
-        heading=body.get("heading", 0.0),
-        pitch=body.get("pitch", 0.0),
-        zoom=body.get("zoom", 1.0),
-    )
 
-
-@app.route("/start_episode", methods=["POST"])
-def route_start_episode():
-    eng = _get_engine()
-    if not eng:
-        return _err("Unknown session — call /connect first")
-    return _safe(eng.start_episode)
-
-
-@app.route("/episode", methods=["GET"])
-def route_episode_state():
-    eng = _get_engine()
-    if not eng:
-        return _err("Unknown session — call /connect first")
-    return _safe(eng.get_episode_state)
+    # NOTE: kept your behavior (defaults), but you may want to validate lat/lng later.
+    with _get_session_lock(sid):
+        return _safe(
+            eng.init_panorama,
+            lat=body.get("lat", 0.0),
+            lng=body.get("lng", 0.0),
+            heading=body.get("heading", 0.0),
+            pitch=body.get("pitch", 0.0),
+            zoom=body.get("zoom", 1.0),
+        )
 
 
 @app.route("/move/<direction>", methods=["POST"])
@@ -511,7 +505,9 @@ def route_move(direction):
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
-    return _safe(eng.move, direction)
+    sid = request.headers.get("X-Session-ID")
+    with _get_session_lock(sid):
+        return _safe(eng.move, direction)
 
 
 @app.route("/scroll/<direction>", methods=["POST"])
@@ -519,9 +515,11 @@ def route_scroll(direction):
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
+    sid = request.headers.get("X-Session-ID")
     body = request.get_json(force=True, silent=True) or {}
     delta = body.get("delta", 0.0)
-    return _safe(eng.scroll, direction, delta)
+    with _get_session_lock(sid):
+        return _safe(eng.scroll, direction, delta)
 
 
 @app.route("/zoom/<direction>", methods=["POST"])
@@ -529,17 +527,25 @@ def route_zoom(direction):
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
+    sid = request.headers.get("X-Session-ID")
     body = request.get_json(force=True, silent=True) or {}
     delta = body.get("delta", 0.0)
-    return _safe(eng.zoom, direction, delta)
+    with _get_session_lock(sid):
+        return _safe(eng.zoom, direction, delta)
 
 
-@app.route("/end_episode", methods=["POST"])
-def route_end_episode():
+@app.route("/end_session", methods=["POST"])
+def route_end_sessio():
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
-    return _safe(eng.end_episode)
+    sid = request.headers.get("X-Session-ID")
+    with _get_session_lock(sid):
+        resp = _safe(eng.end_session)
+    payload = resp[0].get_json() if isinstance(resp, tuple) else resp.get_json()
+    if payload and payload.get("ok"):
+        _drop_session(sid)
+    return resp
 
 
 @app.route("/check/direction", methods=["GET"])
@@ -547,7 +553,9 @@ def route_check_direction():
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
-    return _safe(eng.check_direction)
+    sid = request.headers.get("X-Session-ID")
+    with _get_session_lock(sid):
+        return _safe(eng.check_direction)
 
 
 @app.route("/check/available_moves", methods=["GET"])
@@ -555,7 +563,9 @@ def route_check_available_moves():
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
-    return _safe(eng.check_available_moves)
+    sid = request.headers.get("X-Session-ID")
+    with _get_session_lock(sid):
+        return _safe(eng.check_available_moves)
 
 
 @app.route("/state", methods=["GET"])
@@ -576,4 +586,12 @@ if __name__ == "__main__":
     load_dotenv(ROOT / ".env")
 
     port = int(os.getenv("SERVER_PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    use_waitress = os.getenv("USE_WAITRESS", "").lower() in {"1", "true", "yes"}
+    if use_waitress:
+        try:
+            from waitress import serve
+            serve(app, host="0.0.0.0", port=port)
+        except ImportError:
+            app.run(host="0.0.0.0", port=port)
+    else:
+        app.run(host="0.0.0.0", port=port)

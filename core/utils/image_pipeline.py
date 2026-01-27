@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from core.utils.image_store import create_openai_file, save_image
+from core.utils.image_store import save_image
 from core.utils.image_utils import crop_google_logo, fetch_image
 import base64
 
@@ -86,24 +86,3 @@ def capture_state_image_base64(
     )
     return _encode_jpeg_base64(cropped), path
 
-
-def capture_state_image_file_id(
-    state: Dict[str, Any],
-    session_id: str,
-    root_dir: str,
-    step: int | None = None,
-    trim_bottom: int = 60,
-    size: str = "640x640",
-    purpose: str = "vision",
-    api_key: str | None = None,
-) -> tuple[str, str]:
-    _, path = _capture_and_save(
-        state,
-        session_id=session_id,
-        root_dir=root_dir,
-        step=step,
-        trim_bottom=trim_bottom,
-        size=size,
-    )
-    file_id = create_openai_file(path, purpose=purpose, api_key=api_key)
-    return file_id, path

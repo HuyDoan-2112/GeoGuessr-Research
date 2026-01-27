@@ -1,0 +1,15 @@
+FROM mcr.microsoft.com/playwright:v1.57.0-jammy
+
+WORKDIR /app/adapters/streetview_js
+
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+COPY adapters/streetview_js/package.json adapters/streetview_js/package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY adapters/streetview_js/ ./
+
+USER pwuser
+
+CMD ["node", "host.js"]

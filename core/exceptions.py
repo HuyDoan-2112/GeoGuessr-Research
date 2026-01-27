@@ -27,7 +27,7 @@ class HostTimeoutError(HostError):
         self.req_id = req_id
         msg = f"Host request '{method}' timed out after {timeout}s"
         if req_id:
-            msg += f"(req_id={req_id})"
+            msg += f" (req_id={req_id})"
         super().__init__(msg)
 
 class HostResponseError(HostError):
