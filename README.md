@@ -1,22 +1,39 @@
 # GeoGuessr Research
 
-CLI pipeline that drives Google Street View via a Playwright (Node) host and Python tooling, with optional image capture per step.
+Research toolkit for driving Google Street View with a Playwright (Node) host and a Python API/server. Includes a wrapper CLI for quick manual testing and image capture.
 
-## Quickstart (Docker Compose)
-1) Ensure Docker Desktop is running.
-2) Provide a valid `GOOGLE_MAPS_API_KEY` (include your API key; do not commit it).
-3) Build the image: `docker compose build`
-4) Run the multi-agent test: `docker compose up --build`
-5) Stop the stack when done: `docker compose down`
+## Quickstart (Docker, short)
+1) Set your API key (do not commit it):
+   - PowerShell: `setx GOOGLE_MAPS_API_KEY "YOUR_KEY"` then open a new terminal
+2) Build + run:
+   - `docker compose up --build`
+3) Stop:
+   - `docker compose down`
+
+## Wrapper CLI (in Docker)
+Run an interactive CLI against the running server:
+```
+docker compose exec geoguessr-worker python -m apps.wrapper_cli --base-url http://localhost:8000
+```
+
+Common commands:
+```
+init 37.7749 -122.4194
+move north
+scroll right 30
+zoom in 1
+state
+end
+```
 
 ## Outputs
-- Images are written to `/data/images` in the container and stored in a Compose volume.
-- Each run creates `session_<timestamp>/` to avoid collisions.
+- Images are saved in `/data/images` inside the container.
+- Compose mounts that path to the `geoguessr-images` volume by default.
 
 ## Docs
 - `docs/Run-Instructions-CLI.md`
 - `docs/Run-Instructions-Compose.md`
 
 ## Notes
-- macOS is supported; Apple Silicon may require an arm64 Playwright image or emulation.
 - Google Maps JS and Street View Static APIs must be enabled with billing.
+- For Apple Silicon, you may need an arm64 Playwright image or emulation.
