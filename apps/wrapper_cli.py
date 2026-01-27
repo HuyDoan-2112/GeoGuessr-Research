@@ -198,10 +198,10 @@ def main() -> None:
             continue
 
         if tool_name == "check_direction":
-            _print_json({"description": api.check_direction()})
+            _print_json(api.check_direction())
             continue
         if tool_name == "check_available_moves":
-            _print_json({"available_moves": api.check_available_moves()})
+            _print_json(api.check_available_moves())
             continue
 
         _print_json(getattr(api, tool_name)())

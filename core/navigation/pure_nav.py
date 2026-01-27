@@ -99,7 +99,6 @@ def check_available_moves(state_json: str) -> str:
         "scroll_down",
         "zoom_in",
         "zoom_out",
-        "capture_view",
     ]
     return _result(
         {

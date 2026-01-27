@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.navigation import pure_nav
-from core.utils.image_pipeline import capture_state_image, capture_state_image_base64
 from core.tools import nav_tools
 from core.tools.contracts import ToolContext
 from adapters.streetview_js.client import StreetViewHostClient
@@ -50,10 +49,8 @@ class EngineState:
     """Server-side state for the GeoGuessr navigation engine (per-session)."""
 
     # Configuration
-    # Magic Number 1053
     random_seed: int = 1053
     image_root: str = field(default_factory=lambda: os.getenv("IMAGE_OUTPUT_DIR", "images"))
-    max_steps: int = 100
     session_id: Optional[str] = None
 
     # Per-session progress
@@ -74,6 +71,7 @@ class EngineState:
 
     # Outputs
     image_path: Optional[str] = None
+    image_base64: Optional[str] = None
     _image_step: int = 1
 
 
@@ -159,16 +157,10 @@ class Engine:
         updates = getattr(result, "updates", {}) or {}
         if "image_path" in updates:
             self.state.image_path = updates["image_path"]
-        # @HuanzhiMao FIXME: this might be redundant, already synced with the host state
+        if "image_base64" in updates:
+            self.state.image_base64 = updates["image_base64"]
         if "available_moves" in updates:
             self.state.available_moves = updates["available_moves"]
-            
-        if "heading" in updates:
-            self.state.heading = updates["heading"]
-        if "pitch" in updates:
-            self.state.pitch = updates["pitch"]
-        if "zoom" in updates:
-            self.state.zoom = updates["zoom"]
         self._sync_image_step()
 
     def _tool_error(self, result, fallback: str) -> str:
@@ -177,12 +169,12 @@ class Engine:
             return debug.get("error") or debug.get("message") or fallback
         return fallback
 
-    def _pull_host_state(self, capture: bool = False) -> None:
+    def _pull_host_state(self) -> None:
         if not self._host_enabled():
             return
         assert self._host_client is not None
         host_state = self._host_client.get_state(self.state.session_id)
-        self._update_from_host_state(host_state, capture=capture)
+        self._update_from_host_state(host_state)
 
     def _build_host_state(self) -> Dict[str, Any]:
         return {
@@ -197,25 +189,7 @@ class Engine:
             "date": self.state.date,
         }
 
-    def _capture_image(self) -> Optional[str]:
-        # Capture is tied to session_id
-        if not self.state.pano_id or not self.state.session_id:
-            return None
-        try:
-            state = self._build_host_state()
-            path = capture_state_image(
-                state=state,
-                session_id=self.state.session_id,
-                root_dir=self.state.image_root,
-                step=self.state._image_step,
-            )
-            self.state._image_step += 1
-            self.state.image_path = path
-            return path
-        except Exception:
-            return None
-
-    def _update_from_host_state(self, state: Dict[str, Any], capture: bool = True) -> None:
+    def _update_from_host_state(self, state: Dict[str, Any]) -> None:
         self.state.pano_id = state.get("panoId")
         position = state.get("position") or {}
         self.state.lat = position.get("lat")
@@ -228,22 +202,6 @@ class Engine:
 
         self.state.links = state.get("links") or []
         self.state.date = state.get("date")
-
-        # @HuanzhiMao FIXME: this might be redundant
-        self._refresh_available_moves()
-        
-        if capture:
-            self._capture_image()
-
-    def _refresh_available_moves(self) -> None:
-        try:
-            state = self._build_host_state()
-            moves_json = pure_nav.check_available_moves(json.dumps(state))
-            moves_payload = json.loads(moves_json)
-            updates = moves_payload.get("updates") or {}
-            self.state.available_moves = updates.get("available_moves", [])
-        except Exception:
-            self.state.available_moves = []
 
     def _state_snapshot(self) -> Dict[str, Any]:
         return {
@@ -311,23 +269,14 @@ class Engine:
             raise RuntimeError(self._tool_error(result, "init_failed"))
 
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)   # capture already handled by nav_tools
+        self._pull_host_state()
 
         return {
-            "pano_id": self.state.pano_id,
-            "lat": self.state.lat,
-            "lng": self.state.lng,
-            "heading": self.state.heading,
-            "pitch": self.state.pitch,
-            "zoom": self.state.zoom,
+            "image_base64": self.state.image_base64,
             "available_moves": self.state.available_moves,
-            "image_path": self.state.image_path,
         }
 
     def move(self, direction: str) -> Dict[str, Any]:
-        # @HuanzhiMao FIXME: remove constraint
-        # if self.state.step_count >= self.state.max_steps:
-        #     raise RuntimeError("Max steps reached")
 
         fn = self.MOVE_TOOLS.get(direction)
         if not fn:
@@ -340,12 +289,11 @@ class Engine:
 
         self.state.step_count += 1
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)
+        self._pull_host_state()
 
         return {
-            "image_path": self.state.image_path,
+            "image_base64": self.state.image_base64,
             "available_moves": self.state.available_moves,
-            "step_count": self.state.step_count,
         }
 
     def scroll(self, direction: str, delta: float) -> Dict[str, Any]:
@@ -362,9 +310,12 @@ class Engine:
             raise RuntimeError(self._tool_error(result, "scroll_failed"))
 
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)   # capture already handled by nav_tools
+        self._pull_host_state()
 
-        return {"image_path": self.state.image_path, "available_moves": self.state.available_moves}
+        return {
+            "image_base64": self.state.image_base64,
+            "available_moves": self.state.available_moves,
+        }
 
     def zoom(self, direction: str, delta: float) -> Dict[str, Any]:
         if delta is None or not math.isfinite(delta):
@@ -380,9 +331,12 @@ class Engine:
             raise RuntimeError(self._tool_error(result, "zoom_failed"))
 
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)   # capture already handled by nav_tools
+        self._pull_host_state()
 
-        return {"image_path": self.state.image_path, "available_moves": self.state.available_moves}
+        return {
+            "image_base64": self.state.image_base64,
+            "available_moves": self.state.available_moves,
+        }
 
     def end_session(self) -> Dict[str, Any]:
         """
@@ -434,32 +388,6 @@ class Engine:
             raise RuntimeError(self._tool_error(result, "moves_failed"))
         self._apply_tool_result(result)
         return {"available_moves": self.state.available_moves}
-
-    def capture_view(self) -> Dict[str, Any]:
-        """
-        Capture the current view and return the image as base64 encoded string.
-        """
-        if not self.state.pano_id or not self.state.session_id:
-            raise RuntimeError("No panorama loaded — call /init_panorama first")
-        
-        try:
-            state = self._build_host_state()
-            image_base64, path = capture_state_image_base64(
-                state=state,
-                session_id=self.state.session_id,
-                root_dir=self.state.image_root,
-                step=self.state._image_step,
-            )
-            self.state._image_step += 1
-            self.state.image_path = path
-            return {
-                "image_base64": image_base64,
-                "image_path": path,
-                "available_moves": self.state.available_moves,
-            }
-        except Exception as e:
-            raise RuntimeError(f"Failed to capture view: {e}")
-
 
 # ---------------------------------------------------------------------------
 # Flask App
@@ -611,16 +539,6 @@ def route_check_available_moves():
 
 
 # @HuanzhiMao FIXME: do bytes conversion in the caller wrapper
-@app.route("/capture_view", methods=["POST"])
-def route_capture_view():
-    eng = _get_engine()
-    if not eng:
-        return _err("Unknown session — call /connect first")
-    sid = request.headers.get("X-Session-ID")
-    with _get_session_lock(sid):
-        return _safe(eng.capture_view)
-
-
 @app.route("/state", methods=["GET"])
 def route_state():
     eng = _get_engine()

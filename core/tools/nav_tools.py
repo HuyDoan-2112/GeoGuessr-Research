@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from core.tools.contracts import ToolContext, ToolResult
 from core.navigation import pure_nav
-from core.utils.image_pipeline import capture_state_image
+from core.utils.image_pipeline import capture_state_image, capture_state_image_base64
 from adapters.streetview_js.client import StreetViewHostClient
 from core.exceptions import MissingContextError, InvalidArgumentError
 
@@ -54,9 +54,9 @@ def _capture_image(ctx: ToolContext, state: Dict[str, Any]) -> Optional[str]:
         "IMAGE_OUTPUT_DIR", "images"
     )
     step = ctx.meta.get("image_step", 1)
-    path = capture_state_image(state, session_id, image_root, step=step)
+    image_base64, path = capture_state_image_base64(state, session_id, image_root, step=step)
     ctx.meta["image_step"] = step + 1
-    return path
+    return image_base64, path
 
 
 def _available_moves_from_state(state: Dict[str, Any]) -> list[str]:
@@ -88,9 +88,10 @@ def _handle_pure_result(
     if result_type == "command":
         cmd = payload.get("command") or {}
         new_state = _execute_command(ctx, cmd)
-        image_path = _capture_image(ctx, new_state)
+        image_base64, image_path = _capture_image(ctx, new_state)
         updates = {
             "image_path": image_path,
+            "image_base64": image_base64,
             "available_moves": _available_moves_from_state(new_state),
         }
         return ToolResult(updates=updates)
@@ -120,9 +121,10 @@ def init_panorama(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
     client.init(ctx.session_id, lat=lat, lng=lng, heading=heading, pitch=pitch, zoom=zoom)
     client.wait_for_stable(ctx.session_id)
     state = client.get_state(ctx.session_id)
-    image_path = _capture_image(ctx, state)
+    image_base64, image_path = _capture_image(ctx, state)
     updates = {
         "image_path": image_path,
+        "image_base64": image_base64,
         "available_moves": _available_moves_from_state(state),
     }
     return ToolResult(updates=updates)
