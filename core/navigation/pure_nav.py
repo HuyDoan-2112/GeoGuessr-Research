@@ -63,6 +63,7 @@ def _result(updates: Dict[str, Any]) -> str:
 
 def _command(method: str, params: Dict[str, Any]) -> str:
     cmd = build_command(method, params)
+    # @HuanzhiMao FIXME: do we need to dump and load the command? can we just return the command directly?
     return json.dumps({"type": "command", "command": cmd}) 
 
 def check_direction(state_json: str) -> str:
@@ -94,6 +95,7 @@ def check_available_moves(state_json: str) -> str:
         "scroll_down",
         "zoom_in",
         "zoom_out",
+        "capture_view",
     ]
     return _result(
         {

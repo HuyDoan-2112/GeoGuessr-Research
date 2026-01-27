@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.navigation import pure_nav
-from core.utils.image_pipeline import capture_state_image
+from core.utils.image_pipeline import capture_state_image, capture_state_image_base64
 from core.tools import nav_tools
 from core.tools.contracts import ToolContext
 from adapters.streetview_js.client import StreetViewHostClient
@@ -50,7 +50,8 @@ class EngineState:
     """Server-side state for the GeoGuessr navigation engine (per-session)."""
 
     # Configuration
-    random_seed: int = 42
+    # Magic Number 1053
+    random_seed: int = 1053
     image_root: str = field(default_factory=lambda: os.getenv("IMAGE_OUTPUT_DIR", "images"))
     max_steps: int = 100
     session_id: Optional[str] = None
@@ -152,11 +153,16 @@ class Engine:
         self.state._image_step = self._ctx.meta.get("image_step", self.state._image_step)
 
     def _apply_tool_result(self, result) -> None:
+        """
+        Update the engine state with the result of a tool execution.
+        """
         updates = getattr(result, "updates", {}) or {}
         if "image_path" in updates:
             self.state.image_path = updates["image_path"]
+        # @HuanzhiMao FIXME: this might be redundant, already synced with the host state
         if "available_moves" in updates:
             self.state.available_moves = updates["available_moves"]
+            
         if "heading" in updates:
             self.state.heading = updates["heading"]
         if "pitch" in updates:
@@ -199,7 +205,7 @@ class Engine:
             state = self._build_host_state()
             path = capture_state_image(
                 state=state,
-                session_id=self.state.session_id,          # <- changed
+                session_id=self.state.session_id,
                 root_dir=self.state.image_root,
                 step=self.state._image_step,
             )
@@ -223,7 +229,9 @@ class Engine:
         self.state.links = state.get("links") or []
         self.state.date = state.get("date")
 
+        # @HuanzhiMao FIXME: this might be redundant
         self._refresh_available_moves()
+        
         if capture:
             self._capture_image()
 
@@ -264,7 +272,7 @@ class Engine:
         self.state._image_step = 1
         self.state.image_path = None
 
-        return {"session_id": session_id}
+        return {"session_id": session_id, "available_moves": self.state.available_moves}
 
     def load_scenario(self, scenario: Dict[str, Any]) -> Dict[str, Any]:
         # NOTE: This keeps your behavior (setattr if exists),
@@ -282,7 +290,7 @@ class Engine:
             self._ctx.meta["image_root"] = self.state.image_root
             self._ctx.meta["image_step"] = self.state._image_step
 
-        return {"loaded": True}
+        return {"loaded": True, "available_moves": self.state.available_moves}
 
     def init_panorama(
         self,
@@ -317,8 +325,9 @@ class Engine:
         }
 
     def move(self, direction: str) -> Dict[str, Any]:
-        if self.state.step_count >= self.state.max_steps:
-            raise RuntimeError("Max steps reached")
+        # @HuanzhiMao FIXME: remove constraint
+        # if self.state.step_count >= self.state.max_steps:
+        #     raise RuntimeError("Max steps reached")
 
         fn = self.MOVE_TOOLS.get(direction)
         if not fn:
@@ -331,7 +340,7 @@ class Engine:
 
         self.state.step_count += 1
         self._apply_tool_result(result)
-        self._pull_host_state(capture=False)   # capture already handled by nav_tools
+        self._pull_host_state(capture=False)
 
         return {
             "image_path": self.state.image_path,
@@ -355,7 +364,7 @@ class Engine:
         self._apply_tool_result(result)
         self._pull_host_state(capture=False)   # capture already handled by nav_tools
 
-        return {"image_path": self.state.image_path}
+        return {"image_path": self.state.image_path, "available_moves": self.state.available_moves}
 
     def zoom(self, direction: str, delta: float) -> Dict[str, Any]:
         if delta is None or not math.isfinite(delta):
@@ -373,15 +382,23 @@ class Engine:
         self._apply_tool_result(result)
         self._pull_host_state(capture=False)   # capture already handled by nav_tools
 
-        return {"image_path": self.state.image_path}
+        return {"image_path": self.state.image_path, "available_moves": self.state.available_moves}
 
     def end_session(self) -> Dict[str, Any]:
         """
-        Kept for compatibility, but this now just resets session navigation state.
+        Ends the session: notifies the host to close the session, then resets navigation state.
         """
         result_data = {
             "step_count": self.state.step_count,
         }
+
+        # Notify the host to close the session
+        if self._host_client is not None and self.state.session_id:
+            try:
+                self._host_client.close_session(self.state.session_id)
+            except Exception:
+                # Log but don't fail the end_session call if host cleanup fails
+                pass
 
         # Reset navigation state
         self.state.pano_id = None
@@ -408,7 +425,7 @@ class Engine:
             raise RuntimeError(self._tool_error(result, "direction_failed"))
         updates = result.updates or {}
         self._apply_tool_result(result)
-        return {"description": updates.get("description", "")}
+        return {"description": updates.get("description", ""), "available_moves": self.state.available_moves}
 
     def check_available_moves(self) -> Dict[str, Any]:
         ctx = self._ensure_ctx()
@@ -417,6 +434,31 @@ class Engine:
             raise RuntimeError(self._tool_error(result, "moves_failed"))
         self._apply_tool_result(result)
         return {"available_moves": self.state.available_moves}
+
+    def capture_view(self) -> Dict[str, Any]:
+        """
+        Capture the current view and return the image as base64 encoded string.
+        """
+        if not self.state.pano_id or not self.state.session_id:
+            raise RuntimeError("No panorama loaded — call /init_panorama first")
+        
+        try:
+            state = self._build_host_state()
+            image_base64, path = capture_state_image_base64(
+                state=state,
+                session_id=self.state.session_id,
+                root_dir=self.state.image_root,
+                step=self.state._image_step,
+            )
+            self.state._image_step += 1
+            self.state.image_path = path
+            return {
+                "image_base64": image_base64,
+                "image_path": path,
+                "available_moves": self.state.available_moves,
+            }
+        except Exception as e:
+            raise RuntimeError(f"Failed to capture view: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +577,7 @@ def route_zoom(direction):
 
 
 @app.route("/end_session", methods=["POST"])
-def route_end_sessio():
+def route_end_session():
     eng = _get_engine()
     if not eng:
         return _err("Unknown session — call /connect first")
@@ -566,6 +608,17 @@ def route_check_available_moves():
     sid = request.headers.get("X-Session-ID")
     with _get_session_lock(sid):
         return _safe(eng.check_available_moves)
+
+
+# @HuanzhiMao FIXME: do bytes conversion in the caller wrapper
+@app.route("/capture_view", methods=["POST"])
+def route_capture_view():
+    eng = _get_engine()
+    if not eng:
+        return _err("Unknown session — call /connect first")
+    sid = request.headers.get("X-Session-ID")
+    with _get_session_lock(sid):
+        return _safe(eng.capture_view)
 
 
 @app.route("/state", methods=["GET"])

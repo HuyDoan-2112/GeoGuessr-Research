@@ -11,8 +11,7 @@ from io import BytesIO
 def _encode_jpeg_base64(img) -> str:
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=95)
-    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"jpeg;base64,{encoded}"
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def _capture_and_save(
     state: Dict[str, Any],
