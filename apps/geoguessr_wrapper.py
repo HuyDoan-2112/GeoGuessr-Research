@@ -2,6 +2,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Union
 from copy import deepcopy
+from unittest import result
 import requests
 
 
@@ -292,6 +293,20 @@ class GeoGuessrAPI:
         return available_moves
 
     # ------------------------------------------------------------------
+    # Capture
+    # ------------------------------------------------------------------
+
+    def capture_view(self) -> Dict[str, Any]:
+        """Capture the current panorama image.
+
+        Returns:
+            - image_base64 (str): Base64-encoded panorama image.
+            - available_moves (List[str]): Actions available at the current location.
+        """
+        result =  self._call("POST", "/capture/view")
+        return result
+
+    # ------------------------------------------------------------------
     # Movements
     # ------------------------------------------------------------------
 
@@ -299,7 +314,6 @@ class GeoGuessrAPI:
         """Move to the adjacent panorama in the North direction.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/north")
@@ -309,7 +323,6 @@ class GeoGuessrAPI:
         """Move to the adjacent panorama in the Northeast direction.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/northeast")
@@ -319,7 +332,7 @@ class GeoGuessrAPI:
         """Move to the adjacent panorama in the East direction.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
+            
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/east")
@@ -329,7 +342,6 @@ class GeoGuessrAPI:
         """Move to the adjacent panorama in the Southeast direction.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/southeast")
@@ -339,7 +351,6 @@ class GeoGuessrAPI:
         """Move to the adjacent panorama in the South direction.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/south")
@@ -347,8 +358,8 @@ class GeoGuessrAPI:
 
     def move_southwest(self) -> Dict[str, Any]:
         """Move to the adjacent panorama in the Southwest direction.
+
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/southwest")
@@ -358,7 +369,6 @@ class GeoGuessrAPI:
         """Move to the adjacent panorama in the West direction.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/west")
@@ -368,7 +378,6 @@ class GeoGuessrAPI:
         """Move to the adjacent panorama in the Northwest direction.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/northwest")
@@ -386,7 +395,6 @@ class GeoGuessrAPI:
             negative values are treated as their absolute value.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/scroll/left", {"delta": deg})
@@ -400,7 +408,6 @@ class GeoGuessrAPI:
             negative values are treated as their absolute value.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/scroll/right", {"delta": deg})
@@ -414,7 +421,6 @@ class GeoGuessrAPI:
             does not exceed 90.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/scroll/up", {"delta": deg})
@@ -428,7 +434,6 @@ class GeoGuessrAPI:
                 does not go below -90.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/scroll/down", {"delta": deg})
@@ -446,7 +451,6 @@ class GeoGuessrAPI:
                 negative values are treated as their absolute value.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/zoom/in", {"delta": delta})
@@ -461,7 +465,6 @@ class GeoGuessrAPI:
                 The resulting zoom level is clamped at 0.
 
         Returns:
-            - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/zoom/out", {"delta": delta})

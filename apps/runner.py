@@ -45,6 +45,7 @@ ALIASES = {
     "zoom_out": "zoom_out",
     "check_direction": "check_direction",
     "check_available_moves": "check_available_moves",
+    "capture_view": "capture_view",
 }
 
 
@@ -107,6 +108,7 @@ def _print_help() -> None:
     print("  zoom in|out <delta>")
     print("  check direction")
     print("  check available_moves")
+    print("  capture view")
     print("  state")
     print("  help")
     print("  exit")
@@ -216,6 +218,9 @@ def main() -> None:
 
             if cmd == "check" and rest:
                 cmd = f"check_{rest[0].lower()}"
+                rest = rest[1:]
+            if cmd == "capture" and rest:
+                cmd = f"capture_{rest[0].lower()}"
                 rest = rest[1:]
 
             tool_name = ALIASES.get(cmd)

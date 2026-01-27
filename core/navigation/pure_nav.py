@@ -93,6 +93,7 @@ def check_available_moves(state_json: str) -> str:
         move_actions.append(f"move_{_DIR_TO_FULL[direction]}")
     
     universal_actions = [
+        "capture_view",
         "scroll_up",
         "scroll_left",
         "scroll_right",

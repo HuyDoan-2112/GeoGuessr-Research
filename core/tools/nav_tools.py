@@ -46,9 +46,9 @@ def _execute_command(ctx: ToolContext, cmd: Dict[str, Any]) -> Dict[str, Any]:
     new_state = client.get_state(ctx.session_id)
     return new_state
 
-def _capture_image(ctx: ToolContext, state: Dict[str, Any]) -> Optional[str]:
+def _capture_image(ctx: ToolContext, state: Dict[str, Any]) -> tuple[str | None, str | None]:
     if ctx.meta.get("capture_images") is False:
-        return None
+        return None, None
     session_id = ctx.session_id or f"session_{int(time.time())}"
     image_root = ctx.meta.get("image_root") or os.getenv(
         "IMAGE_OUTPUT_DIR", "images"
@@ -88,10 +88,7 @@ def _handle_pure_result(
     if result_type == "command":
         cmd = payload.get("command") or {}
         new_state = _execute_command(ctx, cmd)
-        image_base64, image_path = _capture_image(ctx, new_state)
         updates = {
-            "image_path": image_path,
-            "image_base64": image_base64,
             "available_moves": _available_moves_from_state(new_state),
         }
         return ToolResult(updates=updates)
@@ -135,6 +132,15 @@ def check_direction(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
 
 def check_available_moves(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
     return _run_pure(ctx, pure_nav.check_available_moves)
+
+def capture_view(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
+    state = _get_state(ctx)
+    image_base64, image_path = _capture_image(ctx, state)
+    updates = {
+        "image_base64": image_base64,
+        "available_moves": _available_moves_from_state(state),
+    }
+    return ToolResult(updates=updates)
 
 
 def move_north(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:

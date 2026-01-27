@@ -37,6 +37,7 @@ ALIASES = {
     "zoom_out": "zoom_out",
     "check_direction": "check_direction",
     "check_available_moves": "check_available_moves",
+    "capture_view": "capture_view",
 }
 
 
@@ -85,6 +86,7 @@ def _print_help() -> None:
     print("  scroll left|right|up|down <delta>")
     print("  zoom in|out <delta>")
     print("  check direction|available_moves")
+    print("  capture view")
     print("  load key=value [key=value ...]")
     print("  state")
     print("  server_state")
@@ -176,6 +178,9 @@ def main() -> None:
             rest = rest[1:]
         if cmd == "check" and rest:
             cmd = f"check_{rest[0].lower()}"
+            rest = rest[1:]
+        if cmd == "capture" and rest:
+            cmd = f"capture_{rest[0].lower()}"
             rest = rest[1:]
         if cmd == "end":
             _print_json(api.end_session())

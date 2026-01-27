@@ -272,7 +272,6 @@ class Engine:
         self._pull_host_state()
 
         return {
-            "image_base64": self.state.image_base64,
             "available_moves": self.state.available_moves,
         }
 
@@ -292,7 +291,6 @@ class Engine:
         self._pull_host_state()
 
         return {
-            "image_base64": self.state.image_base64,
             "available_moves": self.state.available_moves,
         }
 
@@ -313,7 +311,6 @@ class Engine:
         self._pull_host_state()
 
         return {
-            "image_base64": self.state.image_base64,
             "available_moves": self.state.available_moves,
         }
 
@@ -388,6 +385,18 @@ class Engine:
             raise RuntimeError(self._tool_error(result, "moves_failed"))
         self._apply_tool_result(result)
         return {"available_moves": self.state.available_moves}
+
+    def capture_view(self) -> Dict[str, Any]:
+        ctx = self._ensure_ctx()
+        result = nav_tools.capture_view(ctx, {})
+        if not result.ok:
+            raise RuntimeError(self._tool_error(result, "capture_failed"))
+        self._apply_tool_result(result)
+        self._pull_host_state()
+        return {
+            "image_base64": self.state.image_base64,
+            "available_moves": self.state.available_moves,
+        }
 
 # ---------------------------------------------------------------------------
 # Flask App
@@ -532,10 +541,20 @@ def route_check_direction():
 def route_check_available_moves():
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session — call /connect first")
+        return _err("Unknown session - call /connect first")
     sid = request.headers.get("X-Session-ID")
     with _get_session_lock(sid):
         return _safe(eng.check_available_moves)
+
+
+@app.route("/capture/view", methods=["POST"])
+def route_capture_view():
+    eng = _get_engine()
+    if not eng:
+        return _err("Unknown session - call /connect first")
+    sid = request.headers.get("X-Session-ID")
+    with _get_session_lock(sid):
+        return _safe(eng.capture_view)
 
 
 # @HuanzhiMao FIXME: do bytes conversion in the caller wrapper
