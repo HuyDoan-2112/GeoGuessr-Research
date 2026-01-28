@@ -155,6 +155,8 @@ class Engine:
         Update the engine state with the result of a tool execution.
         """
         updates = getattr(result, "updates", {}) or {}
+        # @HuanzhiMao FIXME: no need to store image_path and image_base64 in the state
+        # Also, no capture view after each move, unless called explicitly
         if "image_path" in updates:
             self.state.image_path = updates["image_path"]
         if "image_base64" in updates:
@@ -313,7 +315,6 @@ class Engine:
         self._pull_host_state()
 
         return {
-            "image_base64": self.state.image_base64,
             "available_moves": self.state.available_moves,
         }
 
@@ -376,6 +377,7 @@ class Engine:
         self._apply_tool_result(result)
         self._pull_host_state()
         return {
+            # @HuanzhiMao FIXME: we should just call result.image_base64
             "image_base64": self.state.image_base64,
             "available_moves": self.state.available_moves,
         }
