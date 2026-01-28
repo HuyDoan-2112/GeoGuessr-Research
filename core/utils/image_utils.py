@@ -1,9 +1,13 @@
+import base64
+import hashlib
+import hmac
 import os
 import random
 import threading
 import time
 from io import BytesIO
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from PIL import Image
@@ -36,8 +40,8 @@ def _get_session() -> requests.Session:
 
 
 def _get_with_retries(url: str, timeout: float) -> bytes:
-    max_attempts = max(1, int(os.getenv("IMAGE_FETCH_MAX_ATTEMPTS", "4")))
-    backoff = float(os.getenv("IMAGE_FETCH_BACKOFF_SECS", "0.6"))
+    max_attempts = max(1, int(os.getenv("IMAGE_FETCH_MAX_ATTEMPTS", "6")))
+    backoff = float(os.getenv("IMAGE_FETCH_BACKOFF_SECS", "1.0"))
     jitter = float(os.getenv("IMAGE_FETCH_JITTER_SECS", "0.2"))
     session = _get_session()
     last_exc: Optional[Exception] = None
@@ -49,7 +53,7 @@ def _get_with_retries(url: str, timeout: float) -> bytes:
             return resp.content
         except requests.exceptions.HTTPError as exc:
             status = exc.response.status_code if exc.response else None
-            if status is not None and 500 <= status < 600:
+            if status is not None and (500 <= status < 600 or status in (403, 429)):
                 last_exc = exc
             else:
                 raise
@@ -62,6 +66,16 @@ def _get_with_retries(url: str, timeout: float) -> bytes:
     if last_exc:
         raise last_exc
     raise RuntimeError("image_fetch_failed")
+
+
+def _sign_url(url: str, signing_secret: str) -> str:
+    """Append a Google Maps URL signature using HMAC-SHA1."""
+    parsed = urlparse(url)
+    url_to_sign = parsed.path + "?" + parsed.query
+    decoded_key = base64.urlsafe_b64decode(signing_secret)
+    signature = hmac.new(decoded_key, url_to_sign.encode("utf-8"), hashlib.sha1)
+    encoded_sig = base64.urlsafe_b64encode(signature.digest()).decode("utf-8")
+    return url + "&signature=" + encoded_sig
 
 
 def fetch_image(
@@ -87,6 +101,10 @@ def fetch_image(
         f"&heading={h:.2f}&pitch={p:.2f}&fov={fov}"
         f"&key={api_key}"
     )
+
+    signing_secret = os.getenv("GOOGLE_MAPS_URL_SIGNING_SECRET")
+    if signing_secret:
+        url = _sign_url(url, signing_secret)
 
     timeout = float(os.getenv("IMAGE_FETCH_TIMEOUT_SECS", "5"))
     return _get_with_retries(url, timeout=timeout)
