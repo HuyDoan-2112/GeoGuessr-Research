@@ -1,24 +1,7 @@
 import json
 import os
-from typing import Any, Dict, List, Optional, Union
-from copy import deepcopy
-from unittest import result
+from typing import Any, Dict, Optional
 import requests
-
-
-DEFAULT_STATE = {
-    "session_id": None,
-    "step_count": 0,
-    "pano_id": None,
-    "lat": None,
-    "lng": None,
-    "heading": 0.0,
-    "pitch": 0.0,
-    "zoom": 1.0,
-    "image_path": None,
-    "image_base64": None,
-    "available_moves": [],
-}
 
 
 class GeoGuessrAPI:
@@ -31,17 +14,16 @@ class GeoGuessrAPI:
 
         Args:
             base_url (Optional[str]): Server URL. Falls back to
-                GEOGUESSR_SERVER_URL env var or ``http://geoguessr-worker:8000``.
+                GEOGUESSR_SERVER_URL env var or ``http://127.0.0.1:8000``.
         """
-        self.state: Dict[str, Any] = deepcopy(DEFAULT_STATE)
-        self._base_url = (
-            base_url
-            or os.getenv("GEOGUESSR_SERVER_URL", "http://geoguessr-worker:8000")
+        self._base_url = base_url or os.getenv(
+            "GEOGUESSR_SERVER_URL", "http://127.0.0.1:8000"
         )
-        self.session_id: Optional[str] = None
         self._session = requests.Session()
         self._timeout = (3.05, 30)
-        self.long_context = False
+        # The client only retains the session identifier. All other state lives
+        # on the server and can be fetched via GET /state when needed.
+        self.session_id: Optional[str] = None
 
     # ------------------------------------------------------------------
     #  helper functions
@@ -81,10 +63,8 @@ class GeoGuessrAPI:
         resp.raise_for_status()
         return resp.json()
 
-    def _call(
-        self, method: str, path: str, body: Optional[Dict] = None
-    ) -> Dict[str, Any]:
-        """Make an HTTP call, unwrap the server envelope, and sync local state.
+    def _call(self, method: str, path: str, body: Optional[Dict] = None) -> Dict[str, Any]:
+        """Make an HTTP call and unwrap the server envelope.
 
         Args:
             method (str): HTTP method, either ``"GET"`` or ``"POST"``.
@@ -113,86 +93,47 @@ class GeoGuessrAPI:
             raise RuntimeError(msg)
 
         updates = envelope.get("updates", {})
-        self._sync_state(updates)
+        # Only keep track of the session id client-side.
+        sid = updates.get("session_id")
+        if sid:
+            self.session_id = sid
+            self._session.headers["X-Session-ID"] = sid
         return updates
-
-    def _sync_state(self, updates: Dict[str, Any]) -> None:
-        """Update local AgentState cache from server response fields.
-
-        Args:
-            updates (Dict[str, Any]): Key-value pairs returned by the server.
-                Only recognised field names are applied to ``self.state``.
-        """
-        _FIELDS = (
-            "session_id",
-            "pano_id",
-            "lat",
-            "lng",
-            "heading",
-            "pitch",
-            "zoom",
-            "available_moves",
-            "step_count",
-            "image_path",
-            "image_base64",
-        )
-        for key in _FIELDS:
-            if key in updates:
-                # self.state is a dict, so update it directly
-                self.state[key] = updates[key]
 
     def _load_scenario(
         self,
-        scenario: Dict[str, Union[Dict, str, int, float]],
+        scenario: Dict[str, float],
         long_context: bool = False,
     ) -> None:
-        """Load a scenario configuration into local state and the server.
-
-        Args:
-            scenario (Dict[str, Union[Dict, str, int, float]]): Configuration
-                dict. Recognised keys are applied to ``AgentState``:
-                - random_seed (int): RNG seed for episode ID generation.
-                - image_root (str): Directory for captured images.
-            long_context (bool): Whether to enable long context mode.
-                Defaults to ``False``.
         """
-        for key, value in scenario.items():
-            if key in self.state:
-                self.state[key] = value
-        self.long_context = long_context
-        # Forward to server
-        self._call("POST", "/load_scenario", scenario)
+        Set the starting coordinates for the scenario.
+        Args:
+            scenario (Dict[str, float]): Configuration dict. Forwarded to the server.
+        """
+        return self._call("POST", "/load_scenario", scenario)
 
     def __eq__(self, value: object) -> bool:
-        """Check equality based on agent state.
+        """Check equality based on session identity.
 
         Args:
             value (object): Object to compare against.
 
         Returns:
             is_equal (bool): ``True`` if *value* is a ``GeoGuessrAPI`` instance
-                with an identical cached state.
+                with the same base URL and session id.
         """
         if not isinstance(value, GeoGuessrAPI):
             return False
-        return self.state == value.state
+        return (self._base_url, self.session_id) == (value._base_url, value.session_id)
 
     def get_state(self) -> Dict[str, Any]:
-        """Return the local cached state of the current panorama.
+        """Return the server state snapshot for the current session.
 
-        Returns:
-            - session_id (Optional[str]): Current session identifier.
-            - pano_id (Optional[str]): Active panorama identifier.
-            - lat (Optional[float]): Latitude of current position.
-            - lng (Optional[float]): Longitude of current position.
-            - heading (float): Camera compass heading in degrees.
-            - pitch (float): Camera pitch in degrees.
-            - zoom (float): Camera zoom level.
-            - available_moves (List[str]): Allowed move/scroll/zoom actions.
-            - step_count (int): Steps taken in the current session.
-            - image_path (Optional[str]): Path to the latest captured image.
+        If the client is not connected yet, returns only ``{"session_id": None}``.
         """
-        return dict(self.state)
+        if not self.session_id:
+            return {"session_id": None}
+        return self._call("GET", "/state")
 
     def get_state_json(self) -> str:
         """Return the local cached state as a JSON string.
@@ -227,10 +168,10 @@ class GeoGuessrAPI:
             body["session_id"] = session_id
         result = self._call("POST", "/connect", body)
         # Pin session header so all subsequent requests route to this engine
-        sid = result.get("session_id") or self.state.get("session_id")
+        sid = result.get("session_id") or self.session_id
         if sid:
             self._session.headers["X-Session-ID"] = sid
-            self.state["session_id"] = sid
+            self.session_id = sid
         return result
 
     def init_panorama(
@@ -277,7 +218,7 @@ class GeoGuessrAPI:
 
         Returns:
             - description (str): where is the direction facing at the current state(e.g. ``"Facing N (0.0 degrees)"``).
-            - available_moves (List[str]): List of permitted action names.  
+            - available_moves (List[str]): List of permitted action names.
         """
         result = self._call("GET", "/check/direction")
         return result
@@ -303,7 +244,7 @@ class GeoGuessrAPI:
             - image_base64 (str): Base64-encoded panorama image.
             - available_moves (List[str]): Actions available at the current location.
         """
-        result =  self._call("POST", "/capture/view")
+        result = self._call("POST", "/capture/view")
         return result
 
     # ------------------------------------------------------------------
@@ -332,7 +273,7 @@ class GeoGuessrAPI:
         """Move to the adjacent panorama in the East direction.
 
         Returns:
-            
+
             - available_moves (List[str]): Actions available at the new location.
         """
         data = self._call("POST", "/move/east")
@@ -475,16 +416,14 @@ class GeoGuessrAPI:
     # ------------------------------------------------------------------
 
     def end_session(self) -> Dict[str, Any]:
-        """End the current session navigation state and reset local state.
+        """End the current session on the server and clear local session id.
 
         Returns:
-            - step_count (int): Steps taken so far (before reset).
+            - step_count (int): Steps taken so far (before server reset).
         """
         # If you rename the server route too, change this to "/end_session".
         result = self._call("POST", "/end_session")
-
-        # Reset local cache to defaults, but keep session_id pinned in headers.
-        sid = self.state.get("session_id")
-        self.state = deepcopy(DEFAULT_STATE)
-        self.state["session_id"] = sid
+        # Server drops the session. Clear client-side session routing info.
+        self.session_id = None
+        self._session.headers.pop("X-Session-ID", None)
         return result

@@ -4,13 +4,9 @@ import pytest
 from apps.geoguessr_wrapper import GeoGuessrAPI
 
 
-def test_sync_state_updates_known_fields_only():
+def test_get_state_before_connect_has_session_id_none():
     api = GeoGuessrAPI(base_url="http://localhost:9999")
-    api._sync_state({"lat": 10.5, "lng": -20.25, "unknown": "value"})
-    state = api.get_state()
-    assert state["lat"] == 10.5
-    assert state["lng"] == -20.25
-    assert "unknown" not in state
+    assert api.get_state() == {"session_id": None}
 
 
 def test_call_raises_on_ok_false():
@@ -28,13 +24,20 @@ def test_call_raises_on_non_json():
     with pytest.raises(RuntimeError, match="non-JSON"):
         api._call("POST", "/test", {})
 
+def test_call_tracks_session_id_and_sets_header():
+    api = GeoGuessrAPI(base_url="http://localhost:9999")
+    api._post = lambda path, body=None: {"ok": True, "updates": {"session_id": "s1"}, "error": {}}
+    api._call("POST", "/connect", {})
+    assert api.session_id == "s1"
+    assert api._session.headers["X-Session-ID"] == "s1"
+
 
 def test_connect_host_sets_session_header():
     api = GeoGuessrAPI(base_url="http://localhost:9999")
     api._call = lambda *args, **kwargs: {"session_id": "s1"}
     api.connect_host(api_key="dummy")
     assert api._session.headers["X-Session-ID"] == "s1"
-    assert api.state["session_id"] == "s1"
+    assert api.session_id == "s1"
 
 
 def test_get_state_json_is_valid():
