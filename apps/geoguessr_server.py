@@ -232,24 +232,6 @@ class Engine:
 
         return {"session_id": session_id, "available_moves": self.state.available_moves}
 
-    def load_scenario(self, scenario: Dict[str, Any]) -> Dict[str, Any]:
-        # NOTE: This keeps your behavior (setattr if exists),
-        # but you may want to whitelist keys later.
-        for key, value in scenario.items():
-            if hasattr(self.state, key):
-                setattr(self.state, key, value)
-
-        self._random = random.Random(self.state.random_seed)
-
-        if not scenario.get("image_root"):
-            self.state.image_root = os.getenv("IMAGE_OUTPUT_DIR", "images")
-
-        if self._ctx is not None:
-            self._ctx.meta["image_root"] = self.state.image_root
-            self._ctx.meta["image_step"] = self.state._image_step
-
-        return {"loaded": True, "available_moves": self.state.available_moves}
-
     def init_panorama(
         self,
         lat: float,
@@ -448,15 +430,6 @@ def route_connect():
     sid = data["session_id"]
     engines[sid] = eng
     return _ok(data)
-
-
-@app.route("/load_scenario", methods=["POST"])
-def route_load_scenario():
-    eng = _get_engine()
-    if not eng:
-        return _err("Unknown session — call /connect first")
-    body = request.get_json(force=True, silent=True) or {}
-    return _safe(eng.load_scenario, body)
 
 
 @app.route("/init_panorama", methods=["POST"])
