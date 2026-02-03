@@ -215,8 +215,8 @@ class TestReproBug3_InConeBoundary:
             "links": [{"heading": 22.5, "panoId": "boundary_pano"}],
         }
         result = json.loads(pure_nav.move_northeast(json.dumps(state)))
-        assert result["type"] == "command"
-        assert result["command"]["params"]["panoId"] == "boundary_pano"
+        assert result["type"] == "result"
+        assert result["updates"]["next_pano_id"] == "boundary_pano"
 
 
 class TestReproBug4_CloseSessionNullProc:
@@ -410,7 +410,7 @@ class TestInvariant_DirectionConesTotalCoverage:
 
 
 class TestInvariant_PureNavRoundTrip:
-    """Every pure_nav function must return valid JSON with type='result' or type='command'."""
+    """Every pure_nav function must return valid JSON with type='result'."""
 
     @pytest.fixture
     def state_json(self):
@@ -434,7 +434,7 @@ class TestInvariant_PureNavRoundTrip:
         raw = fn(state_json)
         payload = json.loads(raw)
         assert "type" in payload, f"{func_name} output missing 'type' key"
-        assert payload["type"] in ("result", "command"), (
+        assert payload["type"] == "result", (
             f"{func_name} returned unknown type: {payload['type']}"
         )
 
@@ -447,7 +447,7 @@ class TestInvariant_PureNavRoundTrip:
         fn = getattr(pure_nav, func_name)
         raw = fn(state_json, 30.0)
         payload = json.loads(raw)
-        assert payload["type"] in ("result", "command")
+        assert payload["type"] == "result"
 
 
 # ============================================================================
@@ -502,8 +502,8 @@ class TestBinarySearch_PureNavLayer:
         from core.navigation.pure_nav import move_east
         links = [{"heading": 90.0, "panoId": "east_pano"}]
         result = json.loads(move_east(self._make_state(links=links)))
-        assert result["type"] == "command"
-        assert result["command"]["params"]["panoId"] == "east_pano"
+        assert result["type"] == "result"
+        assert result["updates"]["next_pano_id"] == "east_pano"
 
     def test_move_fails_when_no_link(self):
         from core.navigation.pure_nav import move_east
@@ -516,34 +516,34 @@ class TestBinarySearch_PureNavLayer:
     def test_scroll_left_decreases_heading(self):
         from core.navigation.pure_nav import scroll_left
         result = json.loads(scroll_left(self._make_state(heading=90.0), 30.0))
-        assert result["command"]["params"]["heading"] == 60.0
+        assert result["updates"]["new_heading"] == 60.0
 
     def test_scroll_right_increases_heading(self):
         from core.navigation.pure_nav import scroll_right
         result = json.loads(scroll_right(self._make_state(heading=90.0), 30.0))
-        assert result["command"]["params"]["heading"] == 120.0
+        assert result["updates"]["new_heading"] == 120.0
 
     def test_scroll_up_clamped(self):
         from core.navigation.pure_nav import scroll_up
         result = json.loads(scroll_up(self._make_state(pitch=80.0), 30.0))
-        assert result["command"]["params"]["pitch"] == 90.0
+        assert result["updates"]["new_pitch"] == 90.0
 
     def test_scroll_down_clamped(self):
         from core.navigation.pure_nav import scroll_down
         result = json.loads(scroll_down(self._make_state(pitch=-80.0), 30.0))
-        assert result["command"]["params"]["pitch"] == -90.0
+        assert result["updates"]["new_pitch"] == -90.0
 
     # --- zoom ---
 
     def test_zoom_in(self):
         from core.navigation.pure_nav import zoom_in
         result = json.loads(zoom_in(self._make_state(zoom=1.0), 1.0))
-        assert result["command"]["params"]["zoom"] == 2.0
+        assert result["updates"]["new_zoom"] == 2.0
 
     def test_zoom_out_clamped(self):
         from core.navigation.pure_nav import zoom_out
         result = json.loads(zoom_out(self._make_state(zoom=0.5), 1.0))
-        assert result["command"]["params"]["zoom"] == 0.0
+        assert result["updates"]["new_zoom"] == 0.0
 
     # --- bad inputs ---
 
