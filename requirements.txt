@@ -9,3 +9,4 @@ anthropic
 mypy
 flask
 waitress
+tenacity

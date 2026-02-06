@@ -8,6 +8,6 @@
     "start": "node host.js"
   },
   "dependencies": {
-    "playwright": "^1.41.2"
+    "playwright": "^1.57.0"
   }
 }

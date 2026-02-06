@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile.node
     environment:
       GOOGLE_MAPS_API_KEY: "${GOOGLE_MAPS_API_KEY}"
-      POOL_SIZE: "80"
+      POOL_SIZE: "20"
       STREETVIEW_HOST_PORT: "3000"
     shm_size: "5gb"
     restart: "no"
