@@ -15,20 +15,10 @@ from tenacity import (
     before_sleep_log,
     RetryCallState
 )
+from core.utils.retry import is_retryable_http_error
+
 logger = logging.getLogger(__name__)
 
-def is_retryable_http_error(exception: BaseException) -> bool:
-    """Check if http error is retryable (rate limit, server error, network)."""
-    if isinstance(exception, requests.exceptions.HTTPError):
-        status = exception.response.status_code if exception.response else None
-        return status in {403, 429, 500, 502, 503, 504}
-    
-    if isinstance(exception, (
-        requests.exceptions.Timeout,
-        requests.exceptions.ConnectionError,
-    )):
-        return True
-    return False
 def get_retry_after_delay(retry_state: RetryCallState) -> float:
     """
     Check retry after header on 429 responses indicating how 

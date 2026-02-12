@@ -15,34 +15,13 @@ from tenacity import (
     before_sleep_log,
 )
 from core.exceptions import HostTimeoutError, HostResponseError, MissingContextError
+from core.utils.retry import is_retryable_http_error
 
 logger = logging.getLogger(__name__)
 
 # Configuration via environment
 REQUEST_TIMEOUT = float(os.getenv("HOST_CLIENT_TIMEOUT", "30"))  # seconds
 MAX_ATTEMPTS = int(os.getenv("HOST_CLIENT_MAX_ATTEMPTS", "3"))
-
-
-# Retry logic
-
-def is_retryable_host_error(exception: Exception) -> bool:
-    """Check if error is retryable.
-    
-    Retries on:
-        - Timeout errors
-        - HTTP 403, 429, 500, 502, 503, 504 errors (rate limit, server errors)
-    """
-    # Network errors - always retry
-    if isinstance(exception, (
-        requests.exceptions.Timeout,
-        requests.exceptions.ConnectionError,
-    )):
-        return True
-    # HTTP errors - retry on rate limit and server errors
-    if isinstance(exception, requests.exceptions.HTTPError):
-        status = exception.response.status_code if exception.response else None
-        return status in {403, 429, 500, 502, 503, 504}
-    return False
 
 class StreetViewHostClient:
     def __init__(self, host_url: Optional[str] = None) -> None:
@@ -60,7 +39,7 @@ class StreetViewHostClient:
     @retry(
         stop=stop_after_attempt(MAX_ATTEMPTS),
         wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
-        retry=retry_if_exception(is_retryable_host_error),
+        retry=retry_if_exception(is_retryable_http_error),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
@@ -86,7 +65,7 @@ class StreetViewHostClient:
     @retry(
         stop=stop_after_attempt(MAX_ATTEMPTS),
         wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
-        retry=retry_if_exception(is_retryable_host_error),
+        retry=retry_if_exception(is_retryable_http_error),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )

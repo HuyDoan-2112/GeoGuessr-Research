@@ -21,6 +21,8 @@ from tenacity import (
     before_sleep_log,
 )
 
+from core.utils.retry import is_retryable_http_error
+
 logger = logging.getLogger(__name__)
 
 def zoom_to_fov(zoom, default=90):
@@ -53,25 +55,6 @@ def _get_session() -> requests.Session:
         session.mount("http://", adapter)
         _SESSION_LOCAL.session = session
     return session
-def is_retryable_image_error(exception: BaseException) -> bool:
-    """Check if error is transient and worth retrying."""
-    #Network erros - always retry
-    if isinstance(exception, (
-        requests.exceptions.ConnectionError, 
-        requests.exceptions.Timeout, 
-        requests.exceptions.SSLError
-    )):
-        return True
-
-    # HTTP errors - check status code
-    if isinstance(exception, requests.exceptions.HTTPError):
-        status = exception.response.status_code if exception.response else None
-        # 429 = rate limited, 403 = Google sometimes uses for rate limit
-        # 5xx = server errors
-        if status in (429, 403, 500, 502, 503, 504):
-            return True
-    return False
-
 @retry(
     stop=stop_after_attempt(int(os.getenv("IMAGE_FETCH_MAX_ATTEMPTS", "6"))),
     wait=wait_exponential_jitter(
@@ -79,7 +62,7 @@ def is_retryable_image_error(exception: BaseException) -> bool:
         max=60,
         jitter=float(os.getenv("IMAGE_FETCH_JITTER_SECS", "5")),
     ),
-    retry=retry_if_exception(is_retryable_image_error),
+    retry=retry_if_exception(is_retryable_http_error),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
