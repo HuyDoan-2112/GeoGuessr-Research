@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration via environment
 REQUEST_TIMEOUT = float(os.getenv("HOST_CLIENT_TIMEOUT", "30"))  # seconds
-MAX_ATTEMPTS = int(os.getenv("HOST_CLIENT_MAX_ATTEMPTS", "10"))
+MAX_ATTEMPTS = int(os.getenv("HOST_CLIENT_MAX_ATTEMPTS", "3"))
 
 
 # Retry logic
