@@ -11,7 +11,7 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential_jitter,
-    retry_if_exception,    
+    retry_if_exception,
     before_sleep_log,
 )
 from core.exceptions import HostTimeoutError, HostResponseError, MissingContextError
@@ -60,7 +60,7 @@ class StreetViewHostClient:
     @retry(
         stop=stop_after_attempt(MAX_ATTEMPTS),
         wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
-        retry=retry_if_exception(is_retryable_host_error   ),
+        retry=retry_if_exception(is_retryable_host_error),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
