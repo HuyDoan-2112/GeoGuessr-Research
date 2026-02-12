@@ -92,7 +92,6 @@ class StreetViewHostClient:
     )
 
     def _get(self, path: str) -> Any:
-        url = f"{self.host_url}{path}"
         """GET with retry for timeout/connection errors."""
         url = f"{self.host_url}{path}"
         logger.debug("GET %s", url)
