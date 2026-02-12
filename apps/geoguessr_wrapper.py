@@ -36,7 +36,7 @@ def get_retry_after_delay(retry_state: RetryCallState) -> float:
         if retry_after is not None:
             try:
                 delay  = float(retry_after)
-                logger.info(f"Retry-after header: waiting{delay}")
+                logger.info(f"Retry-after header: waiting {delay}s")
                 return min(delay, 60) # Cap at 60s
             except (TypeError, ValueError):
                 pass
