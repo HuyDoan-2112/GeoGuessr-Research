@@ -126,21 +126,24 @@ def _sweep_zombie_sessions() -> None:
                 elif idle > SESSION_IDLE_TIMEOUT:
                     zombies.append((sid, f"idle_timeout ({idle:.0f}s > {SESSION_IDLE_TIMEOUT}s)"))
         
-        # Close zombie sessions
+        # Close zombie sessions — remove from registry first to prevent
+        # concurrent access, then call end_session() on the detached engine.
         for sid, reason in zombies:
             logger.warning(f"Sweeping zombie session {sid}: {reason}")
-            try:
-                with ENGINES_LOCK:
-                    eng = engines.get(sid)
-                if eng:
-                    try:
-                        eng.end_session()
-                    except Exception as e:
-                        logger.error(f"Error ending session {sid}: {e}")
-            except Exception as e:
-                logger.error(f"Sweep error for {sid}: {e}")
-            finally:
-                _drop_session(sid)
+            with ENGINES_LOCK:
+                eng = engines.pop(sid, None)
+            # Clean up tracking dicts (session locks, created/active times)
+            with _LOCKS_LOCK:
+                _SESSION_LOCKS.pop(sid, None)
+            with SESSION_TRACKING_LOCK:
+                SESSION_CREATED.pop(sid, None)
+                SESSION_LAST_ACTIVE.pop(sid, None)
+            # Now safe to call end_session — no other thread can reach this engine
+            if eng:
+                try:
+                    eng.end_session()
+                except Exception as e:
+                    logger.error(f"Error ending session {sid}: {e}")
         
         if zombies:
             logger.info(f"Swept {len(zombies)} zombie sessions")
