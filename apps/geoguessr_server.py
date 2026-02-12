@@ -66,7 +66,8 @@ def _drop_session(sid: str) -> None:
         engines.pop(sid, None)
 
 def _register_session(sid: str) -> None:
-    """Track new session creation time."""
+    """Track new session creation time and ensure sweeper is running."""
+    _ensure_sweeper()
     now = time.time()
     with SESSION_TRACKING_LOCK:
         SESSION_CREATED[sid] = now
@@ -149,9 +150,22 @@ def _sweep_zombie_sessions() -> None:
             logger.info(f"Swept {len(zombies)} zombie sessions")
 
 
-# Start sweeper thread on module load
-_sweeper_thread = threading.Thread(target=_sweep_zombie_sessions, daemon=True, name="session-sweeper")
-_sweeper_thread.start()
+# Lazy-start sweeper on first session registration (avoids spawning a
+# thread on bare module import, e.g. during tests or CLI tools).
+_sweeper_started = False
+_sweeper_start_lock = threading.Lock()
+
+
+def _ensure_sweeper() -> None:
+    global _sweeper_started
+    if _sweeper_started:
+        return
+    with _sweeper_start_lock:
+        if _sweeper_started:
+            return
+        t = threading.Thread(target=_sweep_zombie_sessions, daemon=True, name="session-sweeper")
+        t.start()
+        _sweeper_started = True
 
 
 # ---------------------------------------------------------------------------
