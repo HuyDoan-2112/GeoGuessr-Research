@@ -64,33 +64,36 @@ def test_cleanup_on_context_exit():
 
 def test_sweeper_cleans_orphans():
     """Verify sweeper cleans up abandoned sessions."""
+    from unittest.mock import patch
     from apps.geoguessr_wrapper import StreetViewAPI
+    import apps.geoguessr_server as server_mod
 
     if not os.getenv("RUN_SWEEPER_TEST"):
         pytest.skip("Set RUN_SWEEPER_TEST=1 to enable sweeper test (takes ~70s)")
-    
-    # Set short timeout for test
-    os.environ["SESSION_IDLE_TIMEOUT"] = "5"  # 5 seconds
-    
-    api = StreetViewAPI()
-    api._load_scenario({"lat": 40.7, "lng": -74.0})
-    sid = api.session_id
-    
-    # DON'T call _end_session - simulate crash
-    api.session_id = None  # Lose reference
-    
-    # Wait for sweeper (sweep interval + idle timeout + buffer)
-    print("Waiting for sweeper...")
-    time.sleep(70)  # 60s sweep interval + 5s idle + buffer
-    
-    # Session should be gone
-    resp = requests.get(f"{SERVER_URL}/sessions")
-    data = resp.json()
-    sessions = data["updates"]["sessions"]
-    
-    orphan_exists = any(s["session_id"] == sid for s in sessions)
-    assert not orphan_exists, f"Orphan session {sid} not swept!"
-    
+
+    # Patch the module-level variables directly — setting os.environ has no
+    # effect because they were already evaluated at import time.
+    with patch.object(server_mod, "SESSION_IDLE_TIMEOUT", 5), \
+         patch.object(server_mod, "SWEEP_INTERVAL", 5):
+        api = StreetViewAPI()
+        api._load_scenario({"lat": 40.7, "lng": -74.0})
+        sid = api.session_id
+
+        # DON'T call _end_session - simulate crash
+        api.session_id = None  # Lose reference
+
+        # Wait for sweeper (sweep interval + idle timeout + buffer)
+        print("Waiting for sweeper...")
+        time.sleep(15)  # 5s sweep interval + 5s idle + buffer
+
+        # Session should be gone
+        resp = requests.get(f"{SERVER_URL}/sessions")
+        data = resp.json()
+        sessions = data["updates"]["sessions"]
+
+        orphan_exists = any(s["session_id"] == sid for s in sessions)
+        assert not orphan_exists, f"Orphan session {sid} not swept!"
+
     print("✓ Sweeper cleaned orphan session")
 
 if __name__ == "__main__":
