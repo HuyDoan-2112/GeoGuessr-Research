@@ -685,7 +685,7 @@ def route_health():
 # Observability endpoints
 @app.route("/sessions", methods=["GET"])
 def route_sessions():
-    """List all sessions with their tracking info (for debugguing)."""
+    """List all sessions with their tracking info (for debugging)."""
     sessions = []
     with ENGINES_LOCK:
         engine_ids = list(engines.keys())
