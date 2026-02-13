@@ -1,4 +1,4 @@
-"""CLI to exercise GeoGuessrAPI against the server."""
+"""CLI to exercise StreetViewAPI against the server."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import re
 import shlex
 from typing import Any, Dict, Tuple, List
 
-from apps.geoguessr_wrapper import GeoGuessrAPI
+from apps.geoguessr_wrapper import StreetViewAPI
 
 
 ALIASES = {
@@ -108,8 +108,8 @@ def main() -> None:
     parser.add_argument("--no-init", action="store_true")
     args = parser.parse_args()
 
-    api = GeoGuessrAPI(base_url=args.base_url)
-    api.connect_host(api_key=args.api_key, session_id=args.session_id)
+    api = StreetViewAPI(base_url=args.base_url)
+    api._connect_host(api_key=args.api_key, session_id=args.session_id)
 
     if not args.no_init:
         lat = args.lat

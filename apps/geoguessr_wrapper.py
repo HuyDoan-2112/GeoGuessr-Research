@@ -1,8 +1,51 @@
 import base64
+import json
 import os
+import logging
+import time
+import random
 from typing import Any, Dict, List, Optional
 
 import requests
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential_jitter,
+    retry_if_exception,
+    before_sleep_log,
+    RetryCallState
+)
+from core.utils.retry import is_retryable_http_error
+
+logger = logging.getLogger(__name__)
+
+def get_retry_after_delay(retry_state: RetryCallState) -> float:
+    """
+    Check retry after header on 429 responses indicating how 
+    long to wait before retrying.
+    
+    Returns:
+        delay(float): a float number of seconds to wait, or None if not specified.
+
+    """
+    exc = retry_state.outcome.exception()
+
+    # Try to extract Retry-after header
+    if exc is not None and hasattr(exc, "response") and exc.response is not None:
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                delay  = float(retry_after)
+                logger.info(f"Retry-after header: waiting {delay}s")
+                return min(delay, 60) # Cap at 60s
+            except (TypeError, ValueError):
+                pass
+        
+    # Fallback exponential backoff with jitter
+    attempt = retry_state.attempt_number
+    delay = min(2 ** attempt + random.uniform(0, 1), 30)
+    logger.info(f"No valid retry-after header: waiting {delay:.2f}s (attempt {attempt})")
+    return delay
 
 
 class ImageResult:
@@ -50,22 +93,25 @@ class StreetViewAPI:
     StreetView API.
     """
 
-    def __init__(self):
-        """Create a new StreetView API client."""
-        self._api_description = "This tool belongs to the StreetView API, which is used to navigate and capture street views."
-
-        self._base_url = os.getenv("GEOGUESSR_SERVER_URL", "http://127.0.0.1:8000")
+    def __init__(self, base_url: Optional[str] = None):
+        """Create a new StreetView API client with retry and proper session lifecycle."""
+        self._api_description = "This tool belongs to the StreetView API."
+        self._base_url = base_url or os.getenv("GEOGUESSR_SERVER_URL", "http://127.0.0.1:8000")
         self._session = requests.Session()
-        self._timeout = (15, 6000)  # (connect timeout, read timeout)
-        # The client only retains the session identifier. All other state lives
-        # on the server and can be fetched via GET /state when needed.
+        self._timeout = (15, 180)  # (connect timeout, read timeout)
         self.session_id: Optional[str] = None
-        self.available_moves: List[str] = None
+        self.available_moves: List[str] = []
 
     # ------------------------------------------------------------------
-    #  helper functions
+    #  helper functions with tenacity retry
     # ------------------------------------------------------------------
-
+    @retry(
+        stop=stop_after_attempt(10),
+        wait=get_retry_after_delay,
+        retry=retry_if_exception(is_retryable_http_error),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
     def _post(self, path: str, body: Optional[Dict] = None) -> Dict[str, Any]:
         """Send a request to the server to get POST.
 
@@ -83,7 +129,14 @@ class StreetViewAPI:
         )
         resp.raise_for_status()
         return resp.json()
-
+    
+    @retry(
+        stop=stop_after_attempt(10),
+        wait=get_retry_after_delay,
+        retry=retry_if_exception(is_retryable_http_error),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
     def _get(self, path: str) -> Dict[str, Any]:
         """Send a GET request to the server.
 
@@ -136,22 +189,107 @@ class StreetViewAPI:
             self.session_id = sid
             self._session.headers["X-Session-ID"] = sid
         return updates
+    # ------------------------------------------------------------------
+    # Session lifecycle 
+    # ------------------------------------------------------------------
+    def _connect_host(
+        self,
+        session_id: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Start a Street View host session on the server.
 
+        Args:
+            session_id (Optional[str]): Desired session identifier. The server
+                generates one automatically when ``None``.
+
+        Returns:
+            - session_id (str): Assigned session identifier.
+        """
+        # Already connected, reuse unless explicitly requesting new session
+        if self.session_id and not session_id:
+            logger.debug(f"Reusing existing session: {self.session_id}")
+            return {"session_id": self.session_id} 
+        
+        # If we have an old session and want to reconnect, close it first
+        if self.session_id:
+            logger.debug(f"Ending old session before connecting new: {self.session_id}")
+            try:
+                self._end_session()
+            except Exception as e:
+                logger.warning(f"Failed to end old session {self.session_id}: {e}")
+        
+        # create new session
+        body: Dict[str, Any] = {}
+        key = api_key or os.getenv("GOOGLE_MAPS_API_KEY")
+        if key:
+            body["api_key"] = key
+        if session_id:
+            body["session_id"] = session_id
+        result = self._call("POST", "/connect", body)
+        # Pin session header so all subsequent requests route to this engine
+        sid = result.get("session_id") or self.session_id
+        if sid:
+            self._session.headers["X-Session-ID"] = sid
+            self.session_id = sid
+            logger.info(f"Connected to session: {sid}")
+        return result
+
+    def connect_host(
+        self,
+        api_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._connect_host(session_id=session_id, api_key=api_key)
+    
     def _load_scenario(
         self,
         scenario: Dict[str, float],
         long_context: bool = False,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """
-        Set the starting coordinates for the scenario.
+        Set the starting coordinates for the scenario only when it not already connected.
         Args:
             scenario (Dict[str, float]): Configuration dict. Forwarded to the server.
         """
-        self._connect_host()
+        if not self.session_id:
+            self._connect_host()
 
         result = self._call("POST", "/init_panorama", scenario)
         self.available_moves = result.get("available_moves", [])
         return result
+
+    def init_panorama(
+        self,
+        lat: float,
+        lng: float,
+        heading: float = 0.0,
+        pitch: float = 0.0,
+        zoom: float = 1.0,
+    ) -> Dict[str, Any]:
+        return self._load_scenario(
+            {"lat": lat, "lng": lng, "heading": heading, "pitch": pitch, "zoom": zoom}
+        )
+    
+    def _end_session(self) -> Dict[str, Any]:
+        """End the current session on the server and clear local session id."""
+        if not self.session_id:
+            logger.debug("No session to end")
+            return {"step_count": 0}
+            
+        try:
+            result = self._call("POST", "/end_session")
+        finally:
+            # Always clear local state, even if server call fails
+            old_sid = self.session_id
+            self.session_id = None
+            self._session.headers.pop("X-Session-ID", None)
+            logger.info(f"Ended session: {old_sid}")
+        return result
+
+    def end_session(self) -> Dict[str, Any]:
+        return self._end_session()
 
     def __eq__(self, value: object) -> bool:
         """Check equality based on session identity.
@@ -171,32 +309,19 @@ class StreetViewAPI:
         return self.available_moves
 
     # ------------------------------------------------------------------
-    # Core Connection / Setup
+    # Context manager for guaranteed cleanup
     # ------------------------------------------------------------------
 
-    def _connect_host(self, session_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Start a Street View host session on the server.
-
-        Args:
-            session_id (Optional[str]): Desired session identifier. The server
-                generates one automatically when ``None``.
-
-        Returns:
-            - session_id (str): Assigned session identifier.
-        """
-        body: Dict[str, Any] = {}
-        if os.getenv("GOOGLE_MAPS_API_KEY"):
-            body["api_key"] = os.getenv("GOOGLE_MAPS_API_KEY")
-        if session_id:
-            body["session_id"] = session_id
-        result = self._call("POST", "/connect", body)
-        # Pin session header so all subsequent requests route to this engine
-        sid = result.get("session_id") or self.session_id
-        if sid:
-            self._session.headers["X-Session-ID"] = sid
-            self.session_id = sid
-        return result
+    def __enter__(self) -> "StreetViewAPI":
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        """Guarantee session cleanup on exit."""
+        if self.session_id:
+            try:
+                self._end_session()
+            except Exception as e:
+                logger.warning(f"Failed to end session {self.session_id} on exit: {e}")
 
     # ------------------------------------------------------------------
     # Checks
@@ -213,15 +338,27 @@ class StreetViewAPI:
         self.available_moves = result.get("available_moves", [])
         return {"description": result.get("description", "")}
 
-    # def check_available_moves(self) -> Dict[str, Any]:
-    #     """Check which compass-direction moves are currently available.
 
-    #     Returns:
-    #         - available_moves (List[str]): List of permitted action names.
-    #             Includes scroll, zoom actions and directional moves functions (N, NE, E, SE, S, SW, W, NW).
-    #     """
-    #     available_moves = self._call("GET", "/check/available_moves")
-    #     return available_moves
+    def check_available_moves(self) -> Dict[str, Any]:
+        """
+        Check which compass-direction moves are currently available.
+
+        Returns:
+            - available_moves (List[str]): List of permitted action names.
+               Includes scroll, zoom actions and directional moves functions (N, NE, E, SE, S, SW, W, NW).
+        """
+        available_moves = self._call("GET", "/check/available_moves")
+        self.available_moves = available_moves.get("available_moves", [])
+        return available_moves
+
+    def get_state(self) -> Dict[str, Any]:
+        if not self.session_id:
+            return {"session_id": None}
+        updates = self._call("GET", "/state")
+        return {"session_id": self.session_id, **updates}
+
+    def get_state_json(self) -> str:
+        return json.dumps(self.get_state(), default=str)
 
     # ------------------------------------------------------------------
     # Capture
@@ -401,15 +538,3 @@ class StreetViewAPI:
         result = self._call("POST", "/zoom/out", {"delta": delta})
         self.available_moves = result.get("available_moves", [])
         return self.capture_view()
-
-    # ------------------------------------------------------------------
-    # Session Control
-    # ------------------------------------------------------------------
-
-    def _end_session(self) -> Dict[str, Any]:
-        """End the current session on the server and clear local session id."""
-        result = self._call("POST", "/end_session")
-        # Server drops the session. Clear client-side session routing info.
-        self.session_id = None
-        self._session.headers.pop("X-Session-ID", None)
-        return result

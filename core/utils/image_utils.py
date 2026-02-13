@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import random
 import threading
@@ -12,7 +13,17 @@ from urllib.parse import urlparse
 import requests
 from PIL import Image
 from requests.adapters import HTTPAdapter
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential_jitter,
+    retry_if_exception,
+    before_sleep_log,
+)
 
+from core.utils.retry import is_retryable_http_error
+
+logger = logging.getLogger(__name__)
 
 def zoom_to_fov(zoom, default=90):
     if zoom is None:
@@ -27,6 +38,13 @@ def zoom_to_fov(zoom, default=90):
 
 _SESSION_LOCAL = threading.local()
 
+# Semaphore to limit concurrent image fetches (prevent 429 storms)
+_max_concurrent = (
+    os.getenv("IMAGE_FETCH_MAX_CONCURRENT")
+    or os.getenv("IMAGE_FETCH_CONCURRENCY")
+    or "8"
+)
+IMAGE_FETCH_SEMAPHORE = threading.Semaphore(int(_max_concurrent))
 
 def _get_session() -> requests.Session:
     session = getattr(_SESSION_LOCAL, "session", None)
@@ -37,35 +55,24 @@ def _get_session() -> requests.Session:
         session.mount("http://", adapter)
         _SESSION_LOCAL.session = session
     return session
+@retry(
+    stop=stop_after_attempt(int(os.getenv("IMAGE_FETCH_MAX_ATTEMPTS", "6"))),
+    wait=wait_exponential_jitter(
+        initial=float(os.getenv("IMAGE_FETCH_BACKOFF_SECS", "1.0")),
+        max=60,
+        jitter=float(os.getenv("IMAGE_FETCH_JITTER_SECS", "5")),
+    ),
+    retry=retry_if_exception(is_retryable_http_error),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
 
-
-def _get_with_retries(url: str, timeout: float) -> bytes:
-    max_attempts = max(1, int(os.getenv("IMAGE_FETCH_MAX_ATTEMPTS", "6")))
-    backoff = float(os.getenv("IMAGE_FETCH_BACKOFF_SECS", "1.0"))
-    jitter = float(os.getenv("IMAGE_FETCH_JITTER_SECS", "0.2"))
+def fetch_with_tenacity(url: str, timeout: float) -> bytes:
+    """Fetch URL with Tenacity retry for rate limits and transient errors."""
     session = _get_session()
-    last_exc: Optional[Exception] = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = session.get(url, timeout=timeout)
-            resp.raise_for_status()
-            return resp.content
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response else None
-            if status is not None and (500 <= status < 600 or status in (403, 429)):
-                last_exc = exc
-            else:
-                raise
-        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-            last_exc = exc
-        if attempt < max_attempts:
-            delay = backoff * (2 ** (attempt - 1)) + random.uniform(0, jitter)
-            time.sleep(delay)
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("image_fetch_failed")
+    resp = session.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp.content
 
 
 def _sign_url(url: str, signing_secret: str) -> str:
@@ -86,6 +93,7 @@ def fetch_image(
     size="640x640",
     fov=None,
 ) -> bytes:
+    """Fetch Street View image with rate limit protection."""
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
     if not api_key:
         raise RuntimeError("GOOGLE_MAPS_API_KEY environment variable is not set")
@@ -106,8 +114,10 @@ def fetch_image(
     if signing_secret:
         url = _sign_url(url, signing_secret)
 
-    timeout = float(os.getenv("IMAGE_FETCH_TIMEOUT_SECS", "5"))
-    return _get_with_retries(url, timeout=timeout)
+    timeout = float(os.getenv("IMAGE_FETCH_TIMEOUT_SECS", "10"))
+    
+    with IMAGE_FETCH_SEMAPHORE:
+        return fetch_with_tenacity(url, timeout=timeout)
 
 def crop_google_logo(img_bytes: bytes, trim_bottom: int = 60) -> Image.Image:
     """Crop pixels off the bottom to remove the Google logo."""

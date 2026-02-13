@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json 
+import json
 import math
-from typing import Any, Dict, List, Optional
-from core.navigation.protocol import parse_state, build_command, dump_command
+from typing import Any, Dict, List
+from core.navigation.protocol import parse_state
 
 
 DIR_CONES = {
@@ -37,7 +37,7 @@ def _heading_to_direction(heading: float) -> str:
                 return direction
     return "N"
 
-def _in_cone(h: float, cones: List[tuple[float, float]]) -> bool:
+def in_cone(h: float, cones: List[tuple[float, float]]) -> bool:
     h = _normalize_heading(h)
     for lo, hi in cones:
         if lo <= hi and lo <= h < hi:
@@ -46,32 +46,28 @@ def _in_cone(h: float, cones: List[tuple[float, float]]) -> bool:
             return True
     return False
 
-def _current_heading(state: Dict[str, Any]) -> float:
+def current_heading(state: Dict[str, Any]) -> float:
     return float(state["pov"]["heading"])
 
-def _current_pitch(state: Dict[str, Any]) -> float:
+def current_pitch(state: Dict[str, Any]) -> float:
     return float(state["pov"]["pitch"])
 
-def _current_zoom(state: Dict[str, Any]) -> float:
+def current_zoom(state: Dict[str, Any]) -> float:
     return float(state["pov"]["zoom"])
 
-def _links(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+def links(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     return list(state.get("links") or [])
 
-def _result(updates: Dict[str, Any]) -> str:
+def result(updates: Dict[str, Any]) -> str:
     return json.dumps({"type": "result", "updates": updates})
 
-def _command(method: str, params: Dict[str, Any]) -> str:
-    cmd = build_command(method, params)
-    # @HuanzhiMao FIXME: do we need to dump and load the command? can we just return the command directly?
-    return json.dumps({"type": "command", "command": cmd}) 
 
 def check_direction(state_json: str) -> str:
     state = parse_state(state_json)
-    heading =  _current_heading(state)
+    heading =  current_heading(state)
     direction = _heading_to_direction(heading)
 
-    return _result(
+    return result(
         {
             "heading": heading,
             "direction": direction,
@@ -81,13 +77,12 @@ def check_direction(state_json: str) -> str:
 
 def check_available_moves(state_json: str) -> str:
     state = parse_state(state_json)
-    current_heading = _current_heading(state)
     move_actions: List[str] = []
     _DIR_TO_FULL = {
         "N": "north", "NE": "northeast", "E": "east", "SE": "southeast",
         "S": "south", "SW": "southwest", "W": "west", "NW": "northwest",
     }
-    for link in _links(state):
+    for link in links(state):
         move_heading = float(link["heading"])
         direction = _heading_to_direction(move_heading)
         move_actions.append(f"move_{_DIR_TO_FULL[direction]}")
@@ -101,93 +96,93 @@ def check_available_moves(state_json: str) -> str:
         "zoom_in",
         "zoom_out",
     ]
-    return _result(
+    return result(
         {
             "available_moves": universal_actions + move_actions,
         }
     )
 
-def _move_and_command(state_json: str, direction_key: str) -> str:
+def move_and_result(state_json: str, direction_key: str) -> str:
     state = parse_state(state_json)
     candidates = [
-        link for link in _links(state)
-        if _in_cone(link["heading"], DIR_CONES[direction_key])
+        link for link in links(state)
+        if in_cone(link["heading"], DIR_CONES[direction_key])
     ]
     if not candidates:
-        return _result({"ok": False, "error": f"no moves in {direction_key} cone"})
+        return result({"ok": False, "error": f"no moves in {direction_key} cone"})
     target = candidates[0]
-    return _command("setPano", {"panoId": target["panoId"]})
+    return result({"next_pano_id": target["panoId"]})
 
 
 def move_north(state_json: str) -> str:
-    return _move_and_command(state_json, "N")
+    return move_and_result(state_json, "N")
 def move_northeast(state_json: str) -> str:
-    return _move_and_command(state_json, "NE")
+    return move_and_result(state_json, "NE")
 def move_east(state_json: str) -> str:
-    return _move_and_command(state_json, "E")
+    return move_and_result(state_json, "E")
 def move_southeast(state_json: str) -> str:
-    return _move_and_command(state_json, "SE")
+    return move_and_result(state_json, "SE")
 def move_south(state_json: str) -> str:
-    return _move_and_command(state_json, "S")
+    return move_and_result(state_json, "S")
 def move_southwest(state_json: str) -> str:
-    return _move_and_command(state_json, "SW")
+    return move_and_result(state_json, "SW")
 def move_west(state_json: str) -> str:
-    return _move_and_command(state_json, "W")
+    return move_and_result(state_json, "W")
 def move_northwest(state_json: str) -> str:
-    return _move_and_command(state_json, "NW")
+    return move_and_result(state_json, "NW")
 
 def scroll_left(state_json: str, delta_deg: float) -> str:
     if delta_deg is None or not math.isfinite(float(delta_deg)):
-        return _result({"ok": False, "error": "missing_or_invalid_delta"})
+        return result({"ok": False, "error": "missing_or_invalid_delta"})
     state = parse_state(state_json)
     step = abs(float(delta_deg))
-    current = _current_heading(state)
+    current = current_heading(state)
     new_heading = _normalize_heading(current - step)
-    return _command("setPov", {"heading": new_heading})
+    return result({"new_heading": new_heading})
 
 def scroll_right(state_json: str, delta_deg: float) -> str:
     if delta_deg is None or not math.isfinite(float(delta_deg)):
-        return _result({"ok": False, "error": "missing_or_invalid_delta"})
+        return result({"ok": False, "error": "missing_or_invalid_delta"})
     state = parse_state(state_json)
     step = abs(float(delta_deg))
-    current = _current_heading(state)
+    current = current_heading(state)
     new_heading = _normalize_heading(current + step)
-    return _command("setPov", {"heading": new_heading})
+    return result({"new_heading": new_heading})
 
 def scroll_up(state_json: str, delta_deg: float) -> str:
     if delta_deg is None or not math.isfinite(float(delta_deg)):
-        return _result({"ok": False, "error": "missing_or_invalid_delta"})
+        return result({"ok": False, "error": "missing_or_invalid_delta"})
     state = parse_state(state_json)
     step = abs(float(delta_deg))
-    current = _current_pitch(state)
+    current = current_pitch(state)
     new_pitch = min(current + step, 90.0)
-    return _command("setPov", {"pitch": new_pitch})
+    return result({"new_pitch": new_pitch})
 
 def scroll_down(state_json: str, delta_deg: float) -> str:
     if delta_deg is None or not math.isfinite(float(delta_deg)):
-        return _result({"ok": False, "error": "missing_or_invalid_delta"})
+        return result({"ok": False, "error": "missing_or_invalid_delta"})
     state = parse_state(state_json)
     step = abs(float(delta_deg))
-    current = _current_pitch(state)
+    current = current_pitch(state)
     new_pitch = max(current - step, -90.0)
-    return _command("setPov", {"pitch": new_pitch})
+    return result({"new_pitch": new_pitch})
 
 def zoom_in(state_json: str, delta: float) -> str:
     if delta is None or not math.isfinite(float(delta)):
-        return _result({"ok": False, "error": "missing_or_invalid_delta"})
+        return result({"ok": False, "error": "missing_or_invalid_delta"})
     state = parse_state(state_json)
     step = abs(float(delta))
-    current = _current_zoom(state)
+    current = current_zoom(state)
     new_zoom = current + step
-    return _command("setPov", {"zoom": new_zoom})
+    return result({"new_zoom": new_zoom})
 
 def zoom_out(state_json: str, delta: float) -> str:
     if delta is None or not math.isfinite(float(delta)):
-        return _result({"ok": False, "error": "missing_or_invalid_delta"})
+        return result({"ok": False, "error": "missing_or_invalid_delta"})
     state = parse_state(state_json)
     step = abs(float(delta))
-    current = _current_zoom(state)
+    current = current_zoom(state)
     new_zoom = max(current - step, 0.0)
-    return _command("setPov", {"zoom": new_zoom})
+    return result({"new_zoom": new_zoom})
 
 

@@ -209,8 +209,8 @@ class TestCheckAvailableMoves:
         assert "zoom_in" in moves
         assert "zoom_out" in moves
 
-        # Should include all 8 movement directions (format is move_N, move_E, etc.)
-        assert "move_N" in moves
+        # Should include all 8 movement directions (format is move_north, move_east, etc.)
+        assert "move_north" in moves
 
     def test_no_links_only_universal_actions(self, no_links_state):
         result = json.loads(pure_nav.check_available_moves(json.dumps(no_links_state)))
@@ -241,45 +241,44 @@ class TestMovementFunctions:
     def test_move_north_succes(self, basic_state):
         result = json.loads(pure_nav.move_north(json.dumps(basic_state)))
 
-        assert result["type"] == "command"
-        assert result["command"]["method"] == "setPano"
-        assert result["command"]["params"]["panoId"] == "north_pano"
+        assert result["type"] == "result"
+        assert result["updates"]["next_pano_id"] == "north_pano"
 
     def test_move_east_succes(self, basic_state):
         result = json.loads(pure_nav.move_east(json.dumps(basic_state)))
 
-        assert result["type"] == "command" 
-        assert result["command"]["params"]["panoId"] == "east_pano"           
+        assert result["type"] == "result" 
+        assert result["updates"]["next_pano_id"] == "east_pano"           
 
     def test_move_south_success(self, basic_state):
         result = json.loads(pure_nav.move_south(json.dumps(basic_state)))
         
-        assert result["command"]["params"]["panoId"] == "south_pano"
+        assert result["updates"]["next_pano_id"] == "south_pano"
 
     def test_move_west_success(self, basic_state):
         result = json.loads(pure_nav.move_west(json.dumps(basic_state)))
         
-        assert result["command"]["params"]["panoId"] == "west_pano"
+        assert result["updates"]["next_pano_id"] == "west_pano"
 
     def test_move_northeast_success(self, basic_state):
         result = json.loads(pure_nav.move_northeast(json.dumps(basic_state)))
         
-        assert result["command"]["params"]["panoId"] == "northeast_pano"
+        assert result["updates"]["next_pano_id"] == "northeast_pano"
 
     def test_move_southeast_success(self, basic_state):
         result = json.loads(pure_nav.move_southeast(json.dumps(basic_state)))
         
-        assert result["command"]["params"]["panoId"] == "southeast_pano"
+        assert result["updates"]["next_pano_id"] == "southeast_pano"
 
     def test_move_southwest_success(self, basic_state):
         result = json.loads(pure_nav.move_southwest(json.dumps(basic_state)))
         
-        assert result["command"]["params"]["panoId"] == "southwest_pano"
+        assert result["updates"]["next_pano_id"] == "southwest_pano"
 
     def test_move_northwest_success(self, basic_state):
         result = json.loads(pure_nav.move_northwest(json.dumps(basic_state)))
         
-        assert result["command"]["params"]["panoId"] == "northwest_pano"
+        assert result["updates"]["next_pano_id"] == "northwest_pano"
 
     def test_move_no_link_in_direction(self, no_links_state):
         result = json.loads(pure_nav.move_north(json.dumps(no_links_state)))
@@ -291,8 +290,8 @@ class TestMovementFunctions:
     def test_move_partial_links_available_direction(self, partial_links_state):
         result = json.loads(pure_nav.move_north(json.dumps(partial_links_state)))
         
-        assert result["type"] == "command"
-        assert result["command"]["params"]["panoId"] == "north_pano"
+        assert result["type"] == "result"
+        assert result["updates"]["next_pano_id"] == "north_pano"
 
     def test_move_partial_links_unavailable_direction(self, partial_links_state):
         result = json.loads(pure_nav.move_east(json.dumps(partial_links_state)))
@@ -310,63 +309,61 @@ class TestScrollFunctions:
         basic_state["pov"]["heading"] = 90.0
         result = json.loads(pure_nav.scroll_left(json.dumps(basic_state), 30.0))
 
-        assert result["type"] == "command"
-        assert result["command"]["method"] == "setPov"
-        assert result["command"]["params"]["heading"] == 60.0
+        assert result["type"] == "result"
+        assert result["updates"]["new_heading"] == 60.0
 
     def test_scroll_right(self, basic_state):
         basic_state["pov"]["heading"] = 90.0
         result = json.loads(pure_nav.scroll_right(json.dumps(basic_state), 30.0))
         
-        assert result["command"]["params"]["heading"] == 120.0
+        assert result["updates"]["new_heading"] == 120.0
 
     def test_scroll_left_wrap_around(self, basic_state):
         basic_state["pov"]["heading"] = 10.0
         result = json.loads(pure_nav.scroll_left(json.dumps(basic_state), 30.0))
         
         # 10 - 30 = -20 -> normalized to 340
-        assert result["command"]["params"]["heading"] == 340.0
+        assert result["updates"]["new_heading"] == 340.0
 
     def test_scroll_right_wrap_around(self, basic_state):
         basic_state["pov"]["heading"] = 350.0
         result = json.loads(pure_nav.scroll_right(json.dumps(basic_state), 30.0))
         
         # 350 + 30 = 380 -> normalized to 20
-        assert result["command"]["params"]["heading"] == 20.0
+        assert result["updates"]["new_heading"] == 20.0
 
     def test_scroll_up(self, basic_state):
         basic_state["pov"]["pitch"] = 0.0
         result = json.loads(pure_nav.scroll_up(json.dumps(basic_state), 30.0))
         
-        assert result["command"]["method"] == "setPov"
-        assert result["command"]["params"]["pitch"] == 30.0
+        assert result["updates"]["new_pitch"] == 30.0
 
     def test_scroll_down(self, basic_state):
         basic_state["pov"]["pitch"] = 0.0
         result = json.loads(pure_nav.scroll_down(json.dumps(basic_state), 30.0))
         
-        assert result["command"]["params"]["pitch"] == -30.0
+        assert result["updates"]["new_pitch"] == -30.0
 
     def test_scroll_up_clamped_at_90(self, basic_state):
         basic_state["pov"]["pitch"] = 80.0
         result = json.loads(pure_nav.scroll_up(json.dumps(basic_state), 30.0))
         
         # 80 + 30 = 110, clamped to 90
-        assert result["command"]["params"]["pitch"] == 90.0
+        assert result["updates"]["new_pitch"] == 90.0
 
     def test_scroll_down_clamped_at_negative_90(self, basic_state):
         basic_state["pov"]["pitch"] = -80.0
         result = json.loads(pure_nav.scroll_down(json.dumps(basic_state), 30.0))
         
         # -80 - 30 = -110, clamped to -90
-        assert result["command"]["params"]["pitch"] == -90.0
+        assert result["updates"]["new_pitch"] == -90.0
 
     def test_scroll_with_negative_delta_uses_absolute(self, basic_state):
         basic_state["pov"]["heading"] = 90.0
         result = json.loads(pure_nav.scroll_left(json.dumps(basic_state), -30.0))
         
         # Should use abs(-30) = 30
-        assert result["command"]["params"]["heading"] == 60.0
+        assert result["updates"]["new_heading"] == 60.0
 
     def test_scroll_invalid_delta_none(self, basic_state):
         result = json.loads(pure_nav.scroll_left(json.dumps(basic_state), None))
@@ -391,29 +388,28 @@ class TestZoomFunctions:
         basic_state["pov"]["zoom"] = 1.0
         result = json.loads(pure_nav.zoom_in(json.dumps(basic_state), 1.0))
         
-        assert result["type"] == "command"
-        assert result["command"]["method"] == "setPov"
-        assert result["command"]["params"]["zoom"] == 2.0
+        assert result["type"] == "result"
+        assert result["updates"]["new_zoom"] == 2.0
 
     def test_zoom_out(self, basic_state):
         basic_state["pov"]["zoom"] = 2.0
         result = json.loads(pure_nav.zoom_out(json.dumps(basic_state), 1.0))
         
-        assert result["command"]["params"]["zoom"] == 1.0
+        assert result["updates"]["new_zoom"] == 1.0
 
     def test_zoom_out_clamped_at_zero(self, basic_state):
         basic_state["pov"]["zoom"] = 0.5
         result = json.loads(pure_nav.zoom_out(json.dumps(basic_state), 1.0))
         
         # 0.5 - 1.0 = -0.5, clamped to 0
-        assert result["command"]["params"]["zoom"] == 0.0
+        assert result["updates"]["new_zoom"] == 0.0
 
     def test_zoom_with_negative_delta_uses_absolute(self, basic_state):
         basic_state["pov"]["zoom"] = 1.0
         result = json.loads(pure_nav.zoom_in(json.dumps(basic_state), -1.0))
         
         # Should use abs(-1) = 1
-        assert result["command"]["params"]["zoom"] == 2.0
+        assert result["updates"]["new_zoom"] == 2.0
 
     def test_zoom_invalid_delta(self, basic_state):
         result = json.loads(pure_nav.zoom_in(json.dumps(basic_state), None))

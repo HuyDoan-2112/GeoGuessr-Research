@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import logging
 
 from flask import Flask, request, jsonify
 
@@ -20,12 +21,32 @@ from core.tools import nav_tools
 from core.tools.contracts import ToolContext
 from adapters.streetview_js.client import StreetViewHostClient
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+SESSION_IDLE_TIMEOUT = float(os.getenv("SESSION_IDLE_TIMEOUT", "300"))  # 5 min
+SESSION_MAX_AGE = float(os.getenv("SESSION_MAX_AGE", "1800"))  # 30 min
+SWEEP_INTERVAL = float(os.getenv("SESSION_SWEEP_INTERVAL", "60"))  # 1 min
+
 # ---------------------------------------------------------------------------
 # Per-session locks
 # ---------------------------------------------------------------------------
 _SESSION_LOCKS: Dict[str, threading.Lock] = {}
 _LOCKS_LOCK = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Engine registry lock
+# ---------------------------------------------------------------------------
+ENGINES_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Session tracking for sweeper (NEW)
+# ---------------------------------------------------------------------------
+SESSION_CREATED: Dict[str, float] = {}
+SESSION_LAST_ACTIVE: Dict[str, float] = {}
+SESSION_TRACKING_LOCK = threading.Lock()
 
 def _get_session_lock(sid: str) -> threading.Lock:
     with _LOCKS_LOCK:
@@ -35,9 +56,116 @@ def _get_session_lock(sid: str) -> threading.Lock:
 
 
 def _drop_session(sid: str) -> None:
+    """Remove session from all registries"""
     with _LOCKS_LOCK:
         _SESSION_LOCKS.pop(sid, None)
-    engines.pop(sid, None)
+    with SESSION_TRACKING_LOCK:
+        SESSION_CREATED.pop(sid, None)
+        SESSION_LAST_ACTIVE.pop(sid, None)
+    with ENGINES_LOCK:
+        engines.pop(sid, None)
+
+def _register_session(sid: str) -> None:
+    """Track new session creation time and ensure sweeper is running."""
+    _ensure_sweeper()
+    now = time.time()
+    with SESSION_TRACKING_LOCK:
+        SESSION_CREATED[sid] = now
+        SESSION_LAST_ACTIVE[sid] = now
+    logger.info(f"Session registered: {sid}")
+
+def _touch_session(sid: str) -> None:
+    """Update last active time for session."""
+    now = time.time()
+    with SESSION_TRACKING_LOCK:
+        if sid in SESSION_LAST_ACTIVE:
+            SESSION_LAST_ACTIVE[sid] = now
+            logger.debug(f"Session touched: {sid}")
+        else:
+            logger.warning(f"Attempted to touch unknown session: {sid}")
+
+def _get_session_info(sid: str) -> Optional[Dict[str, float]]:
+    """Get session tracking info."""
+    with SESSION_TRACKING_LOCK:
+        if sid not in SESSION_CREATED:
+            return None
+        now = time.time()
+        created = SESSION_CREATED.get(sid, now)
+        last_active = SESSION_LAST_ACTIVE.get(sid, now)
+        return {
+            "session_id": sid,
+            "created_at": created,
+            "last_active": last_active,
+            "age_seconds": now - created,
+            "idle_seconds": now - last_active,
+        }
+    
+# ---------------------------------------------------------------------------
+# Sweeper Thread (NEW)
+# ---------------------------------------------------------------------------
+def _sweep_zombie_sessions() -> None:
+    """Periodically close idle or expired sessions."""
+    logger.info(f"Sweeper started: idle_timeout={SESSION_IDLE_TIMEOUT}s, max_age={SESSION_MAX_AGE}s")
+    
+    while True:
+        time.sleep(SWEEP_INTERVAL)
+        
+        now = time.time()
+        zombies = []
+        
+        # Find zombie sessions
+        with SESSION_TRACKING_LOCK:
+            for sid in list(SESSION_CREATED.keys()):
+                created = SESSION_CREATED.get(sid, now)
+                last_active = SESSION_LAST_ACTIVE.get(sid, now)
+                
+                age = now - created
+                idle = now - last_active
+                
+                if age > SESSION_MAX_AGE:
+                    zombies.append((sid, f"max_age_exceeded ({age:.0f}s > {SESSION_MAX_AGE}s)"))
+                elif idle > SESSION_IDLE_TIMEOUT:
+                    zombies.append((sid, f"idle_timeout ({idle:.0f}s > {SESSION_IDLE_TIMEOUT}s)"))
+        
+        # Close zombie sessions — remove from registry first to prevent
+        # concurrent access, then call end_session() on the detached engine.
+        for sid, reason in zombies:
+            logger.warning(f"Sweeping zombie session {sid}: {reason}")
+            with ENGINES_LOCK:
+                eng = engines.pop(sid, None)
+            # Clean up tracking dicts (session locks, created/active times)
+            with _LOCKS_LOCK:
+                _SESSION_LOCKS.pop(sid, None)
+            with SESSION_TRACKING_LOCK:
+                SESSION_CREATED.pop(sid, None)
+                SESSION_LAST_ACTIVE.pop(sid, None)
+            # Now safe to call end_session — no other thread can reach this engine
+            if eng:
+                try:
+                    eng.end_session()
+                except Exception as e:
+                    logger.error(f"Error ending session {sid}: {e}")
+        
+        if zombies:
+            logger.info(f"Swept {len(zombies)} zombie sessions")
+
+
+# Lazy-start sweeper on first session registration (avoids spawning a
+# thread on bare module import, e.g. during tests or CLI tools).
+_sweeper_started = False
+_sweeper_start_lock = threading.Lock()
+
+
+def _ensure_sweeper() -> None:
+    global _sweeper_started
+    if _sweeper_started:
+        return
+    with _sweeper_start_lock:
+        if _sweeper_started:
+            return
+        t = threading.Thread(target=_sweep_zombie_sessions, daemon=True, name="session-sweeper")
+        t.start()
+        _sweeper_started = True
 
 
 # ---------------------------------------------------------------------------
@@ -390,32 +518,37 @@ app = Flask(__name__)
 engines: Dict[str, Engine] = {}
 
 
-def _ok(data: Dict[str, Any]):
+def ok_response(data: Dict[str, Any]):
     return jsonify({"ok": True, "updates": data, "error": {}})
 
 
-def _err(message: str, status: int = 400):
+def error_response(message: str, status: int = 400):
     return jsonify({"ok": False, "updates": {}, "error": {"message": message}}), status
 
 
 def _get_engine():
-    """Look up the Engine for the current request's X-Session-ID header."""
+    """Look up the Engine and touch session timestamp."""
     sid = request.headers.get("X-Session-ID")
-    if not sid or sid not in engines:
+    if not sid:
         return None
-    return engines[sid]
+    with ENGINES_LOCK:
+        eng = engines.get(sid)
+    if not eng:
+        return None
+    _touch_session(sid) # Update last_active on every request
+    return eng
 
 
-def _safe(fn, *args, **kwargs):
+def safe_call(fn, *args, **kwargs):
     """Execute engine method, return ok/error envelope."""
     try:
         data = fn(*args, **kwargs)
-        return _ok(data)
+        return ok_response(data)
     except (ValueError, RuntimeError) as e:
-        return _err(str(e), 400)
+        return error_response(str(e), 400)
     except Exception as e:
         app.logger.exception("Unhandled server error")
-        return _err(str(e), 500)
+        return error_response(str(e), 500)
 
 
 @app.route("/connect", methods=["POST"])
@@ -423,28 +556,30 @@ def route_connect():
     body = request.get_json(force=True, silent=True) or {}
     api_key = body.get("api_key") or os.getenv("GOOGLE_MAPS_API_KEY")
     if not api_key:
-        return _err("GOOGLE_MAPS_API_KEY not set")
+        return error_response("GOOGLE_MAPS_API_KEY not set")
     eng = Engine()
     try:
         data = eng.connect(api_key, body.get("session_id"))
     except Exception as e:
-        return _err(str(e))
+        return error_response(str(e))
     sid = data["session_id"]
-    engines[sid] = eng
-    return _ok(data)
+    with ENGINES_LOCK:
+        engines[sid] = eng
+    _register_session(sid) # Track session creation
+    return ok_response(data)
 
 
 @app.route("/init_panorama", methods=["POST"])
 def route_init_panorama():
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session — call /connect first")
+        return error_response("Unknown session — call /connect first")
     sid = request.headers.get("X-Session-ID")
     body = request.get_json(force=True, silent=True) or {}
 
     # NOTE: kept your behavior (defaults), but you may want to validate lat/lng later.
     with _get_session_lock(sid):
-        return _safe(
+        return safe_call(
             eng.init_panorama,
             lat=body.get("lat", 0.0),
             lng=body.get("lng", 0.0),
@@ -458,47 +593,47 @@ def route_init_panorama():
 def route_move(direction):
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session — call /connect first")
+        return error_response("Unknown session — call /connect first")
     sid = request.headers.get("X-Session-ID")
     with _get_session_lock(sid):
-        return _safe(eng.move, direction)
+        return safe_call(eng.move, direction)
 
 
 @app.route("/scroll/<direction>", methods=["POST"])
 def route_scroll(direction):
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session — call /connect first")
+        return error_response("Unknown session — call /connect first")
     sid = request.headers.get("X-Session-ID")
     body = request.get_json(force=True, silent=True) or {}
     delta = body.get("delta", 0.0)
     with _get_session_lock(sid):
-        return _safe(eng.scroll, direction, delta)
+        return safe_call(eng.scroll, direction, delta)
 
 
 @app.route("/zoom/<direction>", methods=["POST"])
 def route_zoom(direction):
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session — call /connect first")
+        return error_response("Unknown session — call /connect first")
     sid = request.headers.get("X-Session-ID")
     body = request.get_json(force=True, silent=True) or {}
     delta = body.get("delta", 0.0)
     with _get_session_lock(sid):
-        return _safe(eng.zoom, direction, delta)
+        return safe_call(eng.zoom, direction, delta)
 
 
 @app.route("/end_session", methods=["POST"])
 def route_end_session():
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session — call /connect first")
+        return error_response("Unknown session — call /connect first")
     sid = request.headers.get("X-Session-ID")
     with _get_session_lock(sid):
-        resp = _safe(eng.end_session)
+        resp = safe_call(eng.end_session)
     payload = resp[0].get_json() if isinstance(resp, tuple) else resp.get_json()
     if payload and payload.get("ok"):
-        _drop_session(sid)
+        _drop_session(sid) # This now also cleans up tracking
     return resp
 
 
@@ -506,30 +641,30 @@ def route_end_session():
 def route_check_direction():
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session — call /connect first")
+        return error_response("Unknown session — call /connect first")
     sid = request.headers.get("X-Session-ID")
     with _get_session_lock(sid):
-        return _safe(eng.check_direction)
+        return safe_call(eng.check_direction)
 
 
 @app.route("/check/available_moves", methods=["GET"])
 def route_check_available_moves():
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session - call /connect first")
+        return error_response("Unknown session - call /connect first")
     sid = request.headers.get("X-Session-ID")
     with _get_session_lock(sid):
-        return _safe(eng.check_available_moves)
+        return safe_call(eng.check_available_moves)
 
 
 @app.route("/capture/view", methods=["POST"])
 def route_capture_view():
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session - call /connect first")
+        return error_response("Unknown session - call /connect first")
     sid = request.headers.get("X-Session-ID")
     with _get_session_lock(sid):
-        return _safe(eng.capture_view)
+        return safe_call(eng.capture_view)
 
 
 # @HuanzhiMao FIXME: do bytes conversion in the caller wrapper
@@ -537,19 +672,48 @@ def route_capture_view():
 def route_state():
     eng = _get_engine()
     if not eng:
-        return _err("Unknown session — call /connect first")
-    return _ok(eng._state_snapshot())
+        return error_response("Unknown session — call /connect first")
+    return ok_response(eng._state_snapshot())
 
 
 @app.route("/health", methods=["GET"])
 def route_health():
-    return _ok({"status": "ok", "active_sessions": len(engines)})
+    with ENGINES_LOCK:
+        active = len(engines)
+    return ok_response({"status": "ok", "active_sessions": active})
+
+# Observability endpoints
+@app.route("/sessions", methods=["GET"])
+def route_sessions():
+    """List all sessions with their tracking info (for debugging)."""
+    sessions = []
+    with ENGINES_LOCK:
+        engine_ids = list(engines.keys())
+    for sid in engine_ids:
+        info = _get_session_info(sid)
+        if info:
+            sessions.append(info)
+    return ok_response({
+        "sessions": sessions,
+        "count": len(sessions),
+        "config": {
+            "idle_timeout": SESSION_IDLE_TIMEOUT,
+            "max_age": SESSION_MAX_AGE,
+            "sweep_interval": SWEEP_INTERVAL,
+        }
+    })
 
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    
     port = int(os.getenv("SERVER_PORT", "8000"))
     use_waitress = os.getenv("USE_WAITRESS", "").lower() in {"1", "true", "yes"}
     if use_waitress:
