@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from tenacity import (
     retry,
-    stop_after_attempt,
+    stop_never,
     wait_exponential_jitter,
     retry_if_exception,
     before_sleep_log,
@@ -46,6 +46,18 @@ def get_retry_after_delay(retry_state: RetryCallState) -> float:
     delay = min(2 ** attempt + random.uniform(0, 1), 30)
     logger.info(f"No valid retry-after header: waiting {delay:.2f}s (attempt {attempt})")
     return delay
+
+
+_log_before_sleep = before_sleep_log(logger, logging.WARNING)
+
+def _before_sleep(retry_state: RetryCallState) -> None:
+    _log_before_sleep(retry_state)
+    if retry_state.attempt_number >= 10:
+        print(
+            f"\n[WARNING] {retry_state.attempt_number} retry attempts made. "
+            "This may indicate an API quota or rate limit issue — please check your quota.\n",
+            flush=True,
+        )
 
 
 class ImageResult:
@@ -106,10 +118,10 @@ class StreetViewAPI:
     #  helper functions with tenacity retry
     # ------------------------------------------------------------------
     @retry(
-        stop=stop_after_attempt(10),
+        stop=stop_never,
         wait=get_retry_after_delay,
         retry=retry_if_exception(is_retryable_http_error),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
+        before_sleep=_before_sleep,
         reraise=True,
     )
     def _post(self, path: str, body: Optional[Dict] = None) -> Dict[str, Any]:
@@ -131,10 +143,10 @@ class StreetViewAPI:
         return resp.json()
     
     @retry(
-        stop=stop_after_attempt(10),
+        stop=stop_never,
         wait=get_retry_after_delay,
         retry=retry_if_exception(is_retryable_http_error),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
+        before_sleep=_before_sleep,
         reraise=True,
     )
     def _get(self, path: str) -> Dict[str, Any]:
