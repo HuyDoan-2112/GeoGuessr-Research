@@ -147,6 +147,8 @@ def main() -> None:
                 "host_client": client,
                 "image_root": os.getenv("IMAGE_OUTPUT_DIR", "images"),
                 "image_step": 1,
+                "api_key": api_key,
+                "url_signing_secret": os.getenv("GOOGLE_MAPS_URL_SIGNING_SECRET"),
             },
         )
         _run_tool(

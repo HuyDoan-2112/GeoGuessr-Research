@@ -92,11 +92,13 @@ def fetch_image(
     zoom=None,
     size="640x640",
     fov=None,
+    api_key: Optional[str] = None,
+    signing_secret: Optional[str] = None,
 ) -> bytes:
     """Fetch Street View image with rate limit protection."""
-    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    api_key = api_key or os.getenv("GOOGLE_MAPS_API_KEY")
     if not api_key:
-        raise RuntimeError("GOOGLE_MAPS_API_KEY environment variable is not set")
+        raise RuntimeError("GOOGLE_MAPS_API_KEY not provided and not set in environment")
 
     h = float(heading) if heading is not None else 0.0
     p = float(pitch) if pitch is not None else 0.0
@@ -110,7 +112,7 @@ def fetch_image(
         f"&key={api_key}"
     )
 
-    signing_secret = os.getenv("GOOGLE_MAPS_URL_SIGNING_SECRET")
+    signing_secret = signing_secret or os.getenv("GOOGLE_MAPS_URL_SIGNING_SECRET")
     if signing_secret:
         url = _sign_url(url, signing_secret)
 

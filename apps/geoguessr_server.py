@@ -253,7 +253,7 @@ class Engine:
             and self._ctx is not None
         )
 
-    def _set_host_context(self, client: StreetViewHostClient, session_id: str) -> None:
+    def _set_host_context(self, client: StreetViewHostClient, session_id: str, api_key: Optional[str] = None, url_signing_secret: Optional[str] = None) -> None:
         self._host_client = client
         self.state.session_id = session_id
         self._ctx = ToolContext(
@@ -262,6 +262,8 @@ class Engine:
                 "host_client": client,
                 "image_root": self.state.image_root,
                 "image_step": self.state._image_step,
+                "api_key": api_key,
+                "url_signing_secret": url_signing_secret,
             },
         )
 
@@ -348,12 +350,12 @@ class Engine:
 
     # --- Public actions (called by Flask routes) ---
 
-    def connect(self, api_key: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+    def connect(self, api_key: str, session_id: Optional[str] = None, url_signing_secret: Optional[str] = None) -> Dict[str, Any]:
         client = StreetViewHostClient()
         if not session_id:
             session_id = f"session_{uuid.uuid4().hex}"
         client.start(session_id, api_key=api_key)
-        self._set_host_context(client, session_id)
+        self._set_host_context(client, session_id, api_key=api_key, url_signing_secret=url_signing_secret)
 
         # reset per-session counters/outputs
         self.state.step_count = 0
@@ -554,12 +556,13 @@ def safe_call(fn, *args, **kwargs):
 @app.route("/connect", methods=["POST"])
 def route_connect():
     body = request.get_json(force=True, silent=True) or {}
-    api_key = body.get("api_key") or os.getenv("GOOGLE_MAPS_API_KEY")
+    api_key = body.get("api_key")
     if not api_key:
-        return error_response("GOOGLE_MAPS_API_KEY not set")
+        return error_response("api_key is required")
+    url_signing_secret = body.get("url_signing_secret")
     eng = Engine()
     try:
-        data = eng.connect(api_key, body.get("session_id"))
+        data = eng.connect(api_key, body.get("session_id"), url_signing_secret=url_signing_secret)
     except Exception as e:
         return error_response(str(e))
     sid = data["session_id"]

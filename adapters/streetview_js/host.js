@@ -337,12 +337,5 @@ process.on("SIGTERM", async () => {
 const PORT = parseInt(process.env.STREETVIEW_HOST_PORT || "3000", 10);
 server.listen(PORT, () => {
   console.log(`[host] Listening on port ${PORT}`);
-  // Auto-start with env key if available
-  const envKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (envKey) {
-    state.apiKey = envKey;
-    ensureBrowser()
-      .then(() => initPool(pool.size))
-      .catch((err) => console.error("[host] Auto-init failed:", err.message));
-  }
+  // Pool is initialized on the first /start call when an API key is provided
 });

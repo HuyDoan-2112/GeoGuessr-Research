@@ -5,7 +5,6 @@ services:
       context: .
       dockerfile: Dockerfile.node
     environment:
-      GOOGLE_MAPS_API_KEY: "${GOOGLE_MAPS_API_KEY}"
       POOL_SIZE: "20"
       STREETVIEW_HOST_PORT: "3000"
     shm_size: "5gb"
@@ -20,7 +19,6 @@ services:
       dockerfile: Dockerfile.python
     command: ["python3", "-m", "apps.geoguessr_server"]
     environment:
-      GOOGLE_MAPS_API_KEY: "${GOOGLE_MAPS_API_KEY}"
       IMAGE_OUTPUT_DIR: /data/images
       SERVER_PORT: "8000"
       STREETVIEW_HOST_URL: "http://streetview-host:3000"

@@ -21,7 +21,7 @@ def client(monkeypatch, server_module):
     server = server_module
     server.engines.clear()
 
-    def fake_connect(self, api_key, session_id=None):
+    def fake_connect(self, api_key, session_id=None, url_signing_secret=None):
         return {"session_id": session_id or "s1"}
 
     monkeypatch.setattr(server.Engine, "connect", fake_connect)
@@ -43,13 +43,12 @@ def test_connect_requires_api_key(client, monkeypatch, server_module):
     data = resp.get_json()
     assert resp.status_code == 400
     assert data["ok"] is False
-    assert "GOOGLE_MAPS_API_KEY" in data["error"]["message"]
+    assert "api_key" in data["error"]["message"]
 
 
 def test_connect_success(client, monkeypatch, server_module):
     server = server_module
-    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "dummy")
-    resp = client.post("/connect", json={})
+    resp = client.post("/connect", json={"api_key": "dummy"})
     data = resp.get_json()
     assert resp.status_code == 200
     assert data["ok"] is True

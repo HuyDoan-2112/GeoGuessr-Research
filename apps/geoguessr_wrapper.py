@@ -208,6 +208,7 @@ class StreetViewAPI:
         self,
         session_id: Optional[str] = None,
         api_key: Optional[str] = None,
+        url_signing_secret: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Start a Street View host session on the server.
@@ -215,6 +216,9 @@ class StreetViewAPI:
         Args:
             session_id (Optional[str]): Desired session identifier. The server
                 generates one automatically when ``None``.
+            api_key (Optional[str]): Google Maps API key. Required by the server.
+            url_signing_secret (Optional[str]): Google Maps URL signing secret
+                for authenticating Street View Static API requests.
 
         Returns:
             - session_id (str): Assigned session identifier.
@@ -222,8 +226,8 @@ class StreetViewAPI:
         # Already connected, reuse unless explicitly requesting new session
         if self.session_id and not session_id:
             logger.debug(f"Reusing existing session: {self.session_id}")
-            return {"session_id": self.session_id} 
-        
+            return {"session_id": self.session_id}
+
         # If we have an old session and want to reconnect, close it first
         if self.session_id:
             logger.debug(f"Ending old session before connecting new: {self.session_id}")
@@ -231,12 +235,15 @@ class StreetViewAPI:
                 self._end_session()
             except Exception as e:
                 logger.warning(f"Failed to end old session {self.session_id}: {e}")
-        
+
         # create new session
         body: Dict[str, Any] = {}
         key = api_key or os.getenv("GOOGLE_MAPS_API_KEY")
         if key:
             body["api_key"] = key
+        secret = url_signing_secret or os.getenv("GOOGLE_MAPS_URL_SIGNING_SECRET")
+        if secret:
+            body["url_signing_secret"] = secret
         if session_id:
             body["session_id"] = session_id
         result = self._call("POST", "/connect", body)
@@ -251,9 +258,10 @@ class StreetViewAPI:
     def connect_host(
         self,
         api_key: Optional[str] = None,
+        url_signing_secret: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return self._connect_host(session_id=session_id, api_key=api_key)
+        return self._connect_host(session_id=session_id, api_key=api_key, url_signing_secret=url_signing_secret)
     
     def _load_scenario(
         self,

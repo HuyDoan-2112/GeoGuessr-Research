@@ -64,7 +64,9 @@ class NavTools:
         )
         step = self.ctx.meta.get("image_step", 1)
         image_base64, path = capture_state_image_base64(
-            state, session_id, image_root, step=step
+            state, session_id, image_root, step=step,
+            api_key=self.ctx.meta.get("api_key"),
+            signing_secret=self.ctx.meta.get("url_signing_secret"),
         )
         self.ctx.meta["image_step"] = step + 1
         return image_base64, path
