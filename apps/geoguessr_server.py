@@ -722,7 +722,7 @@ if __name__ == "__main__":
     if use_waitress:
         try:
             from waitress import serve
-            serve(app, host="0.0.0.0", port=port)
+            serve(app, host="0.0.0.0", port=port, connection_limit=1000, channel_timeout=0)
         except ImportError:
             app.run(host="0.0.0.0", port=port)
     else:
