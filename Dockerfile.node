@@ -9,6 +9,7 @@ COPY adapters/streetview_js/package.json adapters/streetview_js/package-lock.jso
 RUN npm ci --omit=dev
 
 COPY adapters/streetview_js/ ./
+RUN chmod -R a+rX .
 
 USER pwuser
 
