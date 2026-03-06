@@ -556,10 +556,10 @@ def safe_call(fn, *args, **kwargs):
 @app.route("/connect", methods=["POST"])
 def route_connect():
     body = request.get_json(force=True, silent=True) or {}
-    api_key = body.get("api_key")
+    api_key = body.get("api_key") or os.getenv("GOOGLE_MAPS_API_KEY")
     if not api_key:
         return error_response("api_key is required")
-    url_signing_secret = body.get("url_signing_secret")
+    url_signing_secret = body.get("url_signing_secret") or os.getenv("GOOGLE_MAPS_URL_SIGNING_SECRET")
     eng = Engine()
     try:
         data = eng.connect(api_key, body.get("session_id"), url_signing_secret=url_signing_secret)
