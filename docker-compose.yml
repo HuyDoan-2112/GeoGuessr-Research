@@ -10,7 +10,7 @@ services:
     shm_size: "5gb"
     restart: "no"
     ports:
-      - "3000:3000"
+      - "3123:3000"
 
   geoguessr-worker:
   # Python Flask server (engines + nav_tools)
@@ -29,7 +29,7 @@ services:
       - streetview-host
     restart: "no"
     ports:
-      - "8000:8000"
+      - "8123:8000"
 
 volumes:
   geoguessr-images:
