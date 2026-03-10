@@ -108,7 +108,7 @@ class StreetViewAPI:
     def __init__(self, base_url: Optional[str] = None):
         """Create a new StreetView API client with retry and proper session lifecycle."""
         self._api_description = "This tool belongs to the StreetView API."
-        self._base_url = base_url or os.getenv("GEOGUESSR_SERVER_URL", "http://127.0.0.1:8000")
+        self._base_url = base_url or os.getenv("GEOGUESSR_SERVER_URL", "http://127.0.0.1:18000")
         self._session = requests.Session()
         self._timeout = (15, None)  # (connect timeout, no read timeout — wait indefinitely)
         self.session_id: Optional[str] = None

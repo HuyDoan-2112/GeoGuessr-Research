@@ -44,7 +44,7 @@ def test_host_client_retry_on_timeout():
     """StreetViewHostClient._post retries on Timeout, then succeeds."""
     from adapters.streetview_js.client import StreetViewHostClient
 
-    client = StreetViewHostClient("http://localhost:3000")
+    client = StreetViewHostClient("http://localhost:13000")
 
     call_count = [0]
 
@@ -68,7 +68,7 @@ def test_no_retry_on_4xx():
     """Non-retryable errors (e.g. 404) propagate immediately."""
     from adapters.streetview_js.client import StreetViewHostClient
 
-    client = StreetViewHostClient("http://localhost:3000")
+    client = StreetViewHostClient("http://localhost:13000")
 
     call_count = [0]
 

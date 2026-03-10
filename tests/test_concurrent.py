@@ -128,7 +128,7 @@ class TestRetryLogic:
         from apps.geoguessr_wrapper import StreetViewAPI
         
         with patch.object(requests.Session, 'post', mock_rate_limit_then_success):
-            api = StreetViewAPI(base_url="http://localhost:8000")
+            api = StreetViewAPI(base_url="http://localhost:18000")
             
             # Should succeed after retries
             try:
@@ -161,7 +161,7 @@ class TestRetryLogic:
         from apps.geoguessr_wrapper import StreetViewAPI
         
         with patch.object(requests.Session, 'post', mock_post):
-            api = StreetViewAPI(base_url="http://localhost:8000")
+            api = StreetViewAPI(base_url="http://localhost:18000")
             result = api._post("/test")
             assert call_count["n"] == 3  # 2 failures + 1 success
     
@@ -189,7 +189,7 @@ class TestRetryLogic:
         from apps.geoguessr_wrapper import StreetViewAPI
         
         with patch.object(requests.Session, 'post', mock_post):
-            api = StreetViewAPI(base_url="http://localhost:8000")
+            api = StreetViewAPI(base_url="http://localhost:18000")
             result = api._post("/test")
             assert call_count["n"] >= 2  # At least 1 failure + 1 success
     
@@ -207,7 +207,7 @@ class TestRetryLogic:
         from apps.geoguessr_wrapper import StreetViewAPI
         
         with patch.object(requests.Session, 'post', mock_always_fail):
-            api = StreetViewAPI(base_url="http://localhost:8000")
+            api = StreetViewAPI(base_url="http://localhost:18000")
             
             with pytest.raises(requests.exceptions.HTTPError):
                 api._post("/test")
@@ -237,7 +237,7 @@ class TestTimeoutHandling:
         from apps.geoguessr_wrapper import StreetViewAPI
         
         with patch.object(requests.Session, 'post', mock_timeout):
-            api = StreetViewAPI(base_url="http://localhost:8000")
+            api = StreetViewAPI(base_url="http://localhost:18000")
             result = api._post("/test")
             assert call_count["n"] == 3
     
@@ -258,7 +258,7 @@ class TestTimeoutHandling:
         from apps.geoguessr_wrapper import StreetViewAPI
         
         with patch.object(requests.Session, 'post', mock_connection_error):
-            api = StreetViewAPI(base_url="http://localhost:8000")
+            api = StreetViewAPI(base_url="http://localhost:18000")
             result = api._post("/test")
             assert call_count["n"] == 3
 
@@ -532,7 +532,7 @@ class TestIntegration:
     
     @pytest.fixture
     def server_url(self):
-        return os.getenv("GEOGUESSR_SERVER_URL", "http://localhost:8000")
+        return os.getenv("GEOGUESSR_SERVER_URL", "http://localhost:18000")
     
     def test_server_health(self, server_url):
         """Verify server is running."""

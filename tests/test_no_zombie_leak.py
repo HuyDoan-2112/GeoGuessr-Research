@@ -4,7 +4,7 @@ import time
 import pytest
 import requests
 
-SERVER_URL = os.getenv("GEOGUESSR_SERVER_URL", "http://localhost:8000")
+SERVER_URL = os.getenv("GEOGUESSR_SERVER_URL", "http://localhost:18000")
 
 pytestmark = pytest.mark.integration
 

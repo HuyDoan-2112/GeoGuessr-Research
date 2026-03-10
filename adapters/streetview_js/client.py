@@ -27,7 +27,7 @@ class StreetViewHostClient:
     def __init__(self, host_url: Optional[str] = None) -> None:
         self.host_url = (
             host_url
-            or os.getenv("STREETVIEW_HOST_URL", "http://localhost:3000")
+            or os.getenv("STREETVIEW_HOST_URL", "http://localhost:13000")
         ).rstrip("/")
         self._http = requests.Session()
         self._http.headers.update({"Content-Type": "application/json"})
