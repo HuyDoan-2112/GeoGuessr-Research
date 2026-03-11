@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SESSION_IDLE_TIMEOUT = float(os.getenv("SESSION_IDLE_TIMEOUT", "300"))  # 5 min
-SESSION_MAX_AGE = float(os.getenv("SESSION_MAX_AGE", "1800"))  # 30 min
-SWEEP_INTERVAL = float(os.getenv("SESSION_SWEEP_INTERVAL", "60"))  # 1 min
+SESSION_IDLE_TIMEOUT = float(os.getenv("SESSION_IDLE_TIMEOUT", "7200"))  # 120 min
+SESSION_MAX_AGE = float(os.getenv("SESSION_MAX_AGE", "7200"))  # 120 min
+SWEEP_INTERVAL = float(os.getenv("SESSION_SWEEP_INTERVAL", "360"))  # 6 min
 
 # ---------------------------------------------------------------------------
 # Per-session locks
