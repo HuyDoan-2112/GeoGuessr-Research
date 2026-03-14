@@ -186,6 +186,14 @@ class StreetViewHostClient:
         )
         return result.get("imageBase64", "")
 
+    def set_viewport(self, session_id: str, width: int, height: int) -> Any:
+        if not session_id:
+            raise MissingContextError("session_id")
+        return self._post(
+            f"/session/{session_id}/setViewport",
+            {"width": width, "height": height},
+        )
+
     def close_session(self, session_id: str) -> Any:
         if not session_id:
             raise MissingContextError("session_id")

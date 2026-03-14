@@ -257,11 +257,11 @@ class CrawlDatabase:
 # ---------------------------------------------------------------------------
 
 # Default screenshot grid: 8 headings × 5 pitches = 40 shots per panorama.
-# With a square 800×800 viewport at zoom 1, HFOV = VFOV = 90° (rectilinear).
-# 8 headings every 45° covers 360° with 50% horizontal overlap.
+# 8 headings every 45° covers 360° with 50% horizontal overlap at 90° FOV.
 # 5 pitches from -80° to +80° covers full vertical with generous overlap.
 DEFAULT_HEADINGS = [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
 DEFAULT_PITCHES = [-80.0, -40.0, 0.0, 40.0, 80.0]
+DEFAULT_VIEWPORT_SIZE = 1200
 
 # Empirically verified: Google Maps JS StreetViewPanorama at zoom=1 uses
 # rectilinear (pinhole) projection with ~90° FOV on a square viewport.
@@ -289,6 +289,7 @@ class ScreenshotCapture:
         equirect_height: int = 4096,
         quality: int = 95,
         screenshot_format: str = "jpeg",
+        viewport_size: int = DEFAULT_VIEWPORT_SIZE,
     ) -> None:
         self.client = client
         self.session_id = session_id
@@ -300,10 +301,12 @@ class ScreenshotCapture:
         self.equirect_height = equirect_height
         self.quality = quality
         self.screenshot_format = screenshot_format
+        self.viewport_size = viewport_size
         # FOV for the zoom level used during screenshots
         self.fov = GMAPS_FOV
         self.last_equirect_array: Optional[np.ndarray] = None
         self.last_views: Optional[list] = None
+        self._viewport_set = False
 
     def shutdown(self) -> None:
         pass  # no thread pool to clean up
@@ -315,6 +318,13 @@ class ScreenshotCapture:
 
         Returns (relative_path, width, height).
         """
+        if not self._viewport_set:
+            self.client.set_viewport(
+                self.session_id, self.viewport_size, self.viewport_size
+            )
+            self._viewport_set = True
+            logger.info(f"Viewport set to {self.viewport_size}x{self.viewport_size}")
+
         views: list[tuple[np.ndarray, float, float, float]] = []
 
         for pitch in self.pitches:
@@ -538,6 +548,7 @@ class CrawlerConfig:
     api_key: Optional[str] = None
     equirect_width: int = 4096
     equirect_height: int = 2048
+    viewport_size: int = DEFAULT_VIEWPORT_SIZE
 
 
 class CrawlerOrchestrator:
@@ -578,6 +589,7 @@ class CrawlerOrchestrator:
             image_root=self.config.image_root,
             equirect_width=self.config.equirect_width,
             equirect_height=self.config.equirect_height,
+            viewport_size=self.config.viewport_size,
         )
 
         all_stats: list[CrawlStats] = []
@@ -773,6 +785,10 @@ def main() -> None:
         help="Equirectangular output size WxH (default: 4096x2048)",
     )
     parser.add_argument(
+        "--viewport-size", type=int, default=DEFAULT_VIEWPORT_SIZE,
+        help=f"Square viewport size in pixels for screenshots (default: {DEFAULT_VIEWPORT_SIZE})",
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="Resume interrupted crawl jobs from the database",
     )
@@ -808,6 +824,7 @@ def main() -> None:
         dry_run=args.dry_run,
         equirect_width=eq_w,
         equirect_height=eq_h,
+        viewport_size=args.viewport_size,
     )
 
     orchestrator = CrawlerOrchestrator(config)

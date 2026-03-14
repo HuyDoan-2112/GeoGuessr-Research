@@ -164,6 +164,13 @@ const handlers = {
     return callBridge(session, "waitForRender", params);
   },
 
+  async setViewport(session, params) {
+    const w = params.width || 800;
+    const h = params.height || 800;
+    await session.page.setViewportSize({ width: w, height: h });
+    return { width: w, height: h };
+  },
+
   async screenshot(session, params) {
     const quality = (params && params.quality) || 85;
     const format = (params && params.format) || "jpeg";
@@ -366,7 +373,7 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-const PORT = parseInt(process.env.STREETVIEW_HOST_PORT || "3000", 10);
+const PORT = parseInt(process.env.STREETVIEW_HOST_PORT || "13000", 10);
 server.listen(PORT, () => {
   console.log(`[host] Listening on port ${PORT}`);
   // Pool is initialized on the first /start call when an API key is provided
