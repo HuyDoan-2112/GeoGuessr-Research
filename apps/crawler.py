@@ -371,6 +371,17 @@ class CrawlStats:
     panos_visited: int = 0
     tiles_downloaded: int = 0
     errors: int = 0
+    capture_times: list = field(default_factory=list)  # per-pano capture durations (seconds)
+    job_start_time: float = 0.0
+    job_end_time: float = 0.0
+
+    @property
+    def job_duration(self) -> float:
+        return self.job_end_time - self.job_start_time if self.job_start_time else 0.0
+
+    @property
+    def avg_capture_time(self) -> float:
+        return sum(self.capture_times) / len(self.capture_times) if self.capture_times else 0.0
 
 
 class BFSCrawler:
@@ -400,6 +411,7 @@ class BFSCrawler:
         initial_queue: Optional[List[Tuple[str, int]]] = None,
     ) -> CrawlStats:
         stats = CrawlStats()
+        stats.job_start_time = time.time()
 
         if visited is None:
             visited = set()
@@ -480,11 +492,17 @@ class BFSCrawler:
             # Capture equirectangular panorama via browser screenshots
             if not self.dry_run and not self.db.has_equirect(pano_id):
                 try:
+                    t0 = time.time()
                     rel_path, w, h = self.screenshot_capture.capture_equirectangular(
                         pano_id
                     )
+                    capture_dur = time.time() - t0
+                    stats.capture_times.append(capture_dur)
                     self.db.update_equirect(pano_id, rel_path, w, h, 0)
                     stats.tiles_downloaded += 1
+                    logger.info(
+                        f"Captured {pano_id} in {capture_dur:.1f}s"
+                    )
                 except Exception as e:
                     logger.error(f"Screenshot capture failed for {pano_id}: {e}")
                     stats.errors += 1
@@ -500,6 +518,7 @@ class BFSCrawler:
                     f"queue={len(queue)}, errors={stats.errors}"
                 )
 
+        stats.job_end_time = time.time()
         return stats
 
 
@@ -533,6 +552,20 @@ class CrawlerOrchestrator:
         self._session_id: Optional[str] = None
         self._screenshot_capture: Optional[ScreenshotCapture] = None
 
+    @staticmethod
+    def _print_stats(label: str, stats: CrawlStats) -> None:
+        dur = stats.job_duration
+        mins, secs = divmod(dur, 60)
+        logger.info(f"--- {label} ---")
+        logger.info(f"  Panoramas visited : {stats.panos_visited}")
+        logger.info(f"  Screenshots taken : {stats.tiles_downloaded}")
+        logger.info(f"  Errors            : {stats.errors}")
+        logger.info(f"  Total time        : {int(mins)}m {secs:.1f}s")
+        if stats.capture_times:
+            logger.info(f"  Avg capture time  : {stats.avg_capture_time:.1f}s")
+            logger.info(f"  Min capture time  : {min(stats.capture_times):.1f}s")
+            logger.info(f"  Max capture time  : {max(stats.capture_times):.1f}s")
+
     def run(self) -> None:
         session_id = f"crawler_{int(time.time())}"
         self._session_id = session_id
@@ -546,6 +579,9 @@ class CrawlerOrchestrator:
             equirect_width=self.config.equirect_width,
             equirect_height=self.config.equirect_height,
         )
+
+        all_stats: list[CrawlStats] = []
+        run_start = time.time()
 
         try:
             # Resume interrupted jobs
@@ -570,15 +606,35 @@ class CrawlerOrchestrator:
                 self.db.update_job_status(
                     job_id, "completed", panos_visited=stats.panos_visited
                 )
-                logger.info(
-                    f"Job {job_id} completed: {stats.panos_visited} panos, "
-                    f"{stats.tiles_downloaded} screenshots, {stats.errors} errors"
-                )
+                self._print_stats(f"Job {job_id} ({lat}, {lng})", stats)
+                all_stats.append(stats)
         except KeyboardInterrupt:
             logger.info("Interrupted. Progress saved. Use --resume to continue.")
         except Exception as e:
             logger.exception(f"Crawler failed: {e}")
         finally:
+            # Print overall summary
+            if all_stats:
+                total_dur = time.time() - run_start
+                total_panos = sum(s.panos_visited for s in all_stats)
+                total_screenshots = sum(s.tiles_downloaded for s in all_stats)
+                total_errors = sum(s.errors for s in all_stats)
+                all_capture_times = [t for s in all_stats for t in s.capture_times]
+                mins, secs = divmod(total_dur, 60)
+                logger.info("=== CRAWL SUMMARY ===")
+                logger.info(f"  Starting points   : {len(all_stats)}")
+                logger.info(f"  Total panoramas   : {total_panos}")
+                logger.info(f"  Total screenshots : {total_screenshots}")
+                logger.info(f"  Total errors      : {total_errors}")
+                logger.info(f"  Total time        : {int(mins)}m {secs:.1f}s")
+                if all_capture_times:
+                    avg = sum(all_capture_times) / len(all_capture_times)
+                    logger.info(f"  Avg capture time  : {avg:.1f}s")
+                    logger.info(f"  Min capture time  : {min(all_capture_times):.1f}s")
+                    logger.info(f"  Max capture time  : {max(all_capture_times):.1f}s")
+                if total_panos > 0 and total_dur > 0:
+                    logger.info(f"  Avg time per pano : {total_dur / total_panos:.1f}s (including BFS overhead)")
+
             try:
                 self.client.close_session(session_id)
             except Exception:
