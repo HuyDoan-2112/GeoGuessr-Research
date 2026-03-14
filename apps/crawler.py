@@ -1,17 +1,20 @@
 """Street View BFS crawler — download panorama tiles + metadata to local SQLite.
 
+Uses the Google Maps Platform Street View Tiles API for high-quality tile
+downloads and panorama metadata.
+
 Usage:
     python -m apps.crawler --coords 37.7749,-122.4194
-    python -m apps.crawler --coords-file locations.csv --max-steps 50
+    python -m apps.crawler --coords-file locations.csv --max-depth 50
     python -m apps.crawler --resume --db crawl.db
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -19,23 +22,128 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import numpy as np
+import requests
 from PIL import Image
+from requests.adapters import HTTPAdapter
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential_jitter,
+    retry_if_exception,
+    before_sleep_log,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from adapters.streetview_js.client import StreetViewHostClient
-from core.utils.equirect import perspectives_to_equirect
-from core.utils.image_utils import zoom_to_fov
+from core.utils.retry import is_retryable_http_error
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# TilesAPIClient
+# ---------------------------------------------------------------------------
+
+TILES_API_BASE = "https://tile.googleapis.com/v1"
+
+
+class TilesAPIClient:
+    """Client for the Google Maps Platform Street View Tiles API."""
+
+    def __init__(self, api_key: str, max_concurrent: int = 16) -> None:
+        self.api_key = api_key
+        self._http = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=max_concurrent, pool_maxsize=max_concurrent
+        )
+        self._http.mount("https://", adapter)
+        self._token: Optional[str] = None
+        self._token_expiry: float = 0
+        self._lock = threading.Lock()
+
+    def _ensure_token(self) -> str:
+        """Create or refresh the Tiles API session token."""
+        with self._lock:
+            if self._token and time.time() < self._token_expiry - 60:
+                return self._token
+            resp = self._http.post(
+                f"{TILES_API_BASE}/createSession",
+                params={"key": self.api_key},
+                json={
+                    "mapType": "streetview",
+                    "language": "en-US",
+                    "region": "US",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self._token = data["session"]
+            self._token_expiry = int(data["expiry"])
+            logger.info("Tiles API session created (expires %s)", self._token_expiry)
+            return self._token
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
+        retry=retry_if_exception(is_retryable_http_error),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def get_metadata(
+        self,
+        pano_id: Optional[str] = None,
+        lat: Optional[float] = None,
+        lng: Optional[float] = None,
+        radius: int = 50,
+    ) -> Dict[str, Any]:
+        """Fetch panorama metadata by pano_id or coordinates."""
+        token = self._ensure_token()
+        params: Dict[str, Any] = {"session": token, "key": self.api_key}
+        if pano_id:
+            params["panoId"] = pano_id
+        elif lat is not None and lng is not None:
+            params["lat"] = lat
+            params["lng"] = lng
+            params["radius"] = radius
+        else:
+            raise ValueError("Either pano_id or (lat, lng) must be provided")
+        resp = self._http.get(
+            f"{TILES_API_BASE}/streetview/metadata", params=params
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential_jitter(initial=0.5, max=15, jitter=1),
+        retry=retry_if_exception(is_retryable_http_error),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def get_tile(self, pano_id: str, zoom: int, x: int, y: int) -> bytes:
+        """Download a single tile."""
+        token = self._ensure_token()
+        resp = self._http.get(
+            f"{TILES_API_BASE}/streetview/tiles/{zoom}/{x}/{y}",
+            params={
+                "session": token,
+                "key": self.api_key,
+                "panoId": pano_id,
+            },
+        )
+        resp.raise_for_status()
+        return resp.content
+
+    def close(self) -> None:
+        self._http.close()
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +158,7 @@ class CrawlDatabase:
         job_id          INTEGER PRIMARY KEY AUTOINCREMENT,
         start_lat       REAL NOT NULL,
         start_lng       REAL NOT NULL,
-        max_steps       INTEGER NOT NULL DEFAULT 100,
+        max_depth       INTEGER NOT NULL DEFAULT 100,
         status          TEXT NOT NULL DEFAULT 'pending',
         started_at      TEXT,
         completed_at    TEXT,
@@ -69,7 +177,7 @@ class CrawlDatabase:
         equirect_path   TEXT,
         equirect_width  INTEGER,
         equirect_height INTEGER,
-        tile_zoom       INTEGER DEFAULT 3,
+        tile_zoom       INTEGER DEFAULT 5,
         FOREIGN KEY (job_id) REFERENCES crawl_jobs(job_id)
     );
 
@@ -102,13 +210,13 @@ class CrawlDatabase:
 
     # -- crawl_jobs --
 
-    def create_job(self, lat: float, lng: float, max_steps: int) -> int:
+    def create_job(self, lat: float, lng: float, max_depth: int) -> int:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO crawl_jobs (start_lat, start_lng, max_steps, status, started_at) "
+                "INSERT INTO crawl_jobs (start_lat, start_lng, max_depth, status, started_at) "
                 "VALUES (?, ?, ?, 'running', ?)",
-                (lat, lng, max_steps, now),
+                (lat, lng, max_depth, now),
             )
             self._conn.commit()
             return cur.lastrowid  # type: ignore[return-value]
@@ -216,7 +324,7 @@ class CrawlDatabase:
                 from_pano_id,
                 to_id,
                 link.get("heading", 0.0),
-                link.get("description", ""),
+                link.get("description", link.get("text", "")),
                 link.get("date"),
             ))
         if not rows:
@@ -253,112 +361,93 @@ class CrawlDatabase:
 
 
 # ---------------------------------------------------------------------------
-# ScreenshotCapture — captures panoramas via Playwright browser screenshots
+# TileCapture
 # ---------------------------------------------------------------------------
 
-# Default screenshot grid: 8 headings × 5 pitches = 40 shots per panorama.
-# 8 headings every 45° covers 360° with 50% horizontal overlap at 90° FOV.
-# 5 pitches from -80° to +80° covers full vertical with generous overlap.
-DEFAULT_HEADINGS = [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
-DEFAULT_PITCHES = [-80.0, -40.0, 0.0, 40.0, 80.0]
-DEFAULT_VIEWPORT_SIZE = 1200
-
-# Empirically verified: Google Maps JS StreetViewPanorama at zoom=1 uses
-# rectilinear (pinhole) projection with ~90° FOV on a square viewport.
-GMAPS_FOV = 90.0
-
-
-class ScreenshotCapture:
-    """Captures full equirectangular panoramas via Playwright browser screenshots.
-
-    Instead of downloading raw tiles (private Google API), this uses the
-    authenticated Google Maps JS API session in the Playwright browser to
-    render Street View at multiple heading/pitch angles, then stitches the
-    screenshots into an equirectangular image using inverse projection.
-    """
+class TileCapture:
+    """Downloads Street View tiles and stitches into equirectangular panoramas."""
 
     def __init__(
         self,
-        client: StreetViewHostClient,
-        session_id: str,
+        tiles_client: TilesAPIClient,
         image_root: str,
-        headings: Optional[List[float]] = None,
-        pitches: Optional[List[float]] = None,
-        screenshot_zoom: float = 1.0,
-        equirect_width: int = 8192,
-        equirect_height: int = 4096,
+        tile_zoom: int = 5,
         quality: int = 95,
-        screenshot_format: str = "jpeg",
-        viewport_size: int = DEFAULT_VIEWPORT_SIZE,
+        max_workers: int = 8,
     ) -> None:
-        self.client = client
-        self.session_id = session_id
+        self.tiles_client = tiles_client
         self.image_root = image_root
-        self.headings = headings or DEFAULT_HEADINGS
-        self.pitches = pitches or DEFAULT_PITCHES
-        self.screenshot_zoom = screenshot_zoom
-        self.equirect_width = equirect_width
-        self.equirect_height = equirect_height
+        self.tile_zoom = tile_zoom
         self.quality = quality
-        self.screenshot_format = screenshot_format
-        self.viewport_size = viewport_size
-        # FOV for the zoom level used during screenshots
-        self.fov = GMAPS_FOV
-        self.last_equirect_array: Optional[np.ndarray] = None
-        self.last_views: Optional[list] = None
-        self._viewport_set = False
+        self.max_workers = max_workers
 
-    def shutdown(self) -> None:
-        pass  # no thread pool to clean up
+    @staticmethod
+    def _tile_grid(
+        image_width: int, image_height: int,
+        tile_width: int, tile_height: int,
+        zoom: int,
+    ) -> Tuple[int, int, int]:
+        """Compute (actual_zoom, num_x, num_y) for the tile grid.
 
-    def capture_equirectangular(self, pano_id: str) -> Tuple[str, int, int]:
-        """Capture screenshots at multiple angles and stitch into equirectangular.
-
-        The client must already be on the correct panorama (set_pano called).
-
-        Returns (relative_path, width, height).
+        Caps zoom to the max level supported by the panorama's resolution.
         """
-        if not self._viewport_set:
-            self.client.set_viewport(
-                self.session_id, self.viewport_size, self.viewport_size
+        max_zoom = math.ceil(
+            math.log2(max(image_width / tile_width, image_height / tile_height))
+        )
+        actual_zoom = min(zoom, max_zoom)
+        scale = 2 ** (max_zoom - actual_zoom)
+        num_x = math.ceil(image_width / (tile_width * scale))
+        num_y = math.ceil(image_height / (tile_height * scale))
+        return actual_zoom, num_x, num_y
+
+    def capture_equirectangular(
+        self, pano_id: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, int, int, int]:
+        """Download tiles at the configured zoom and stitch into equirectangular.
+
+        Returns (relative_path, width, height, actual_zoom).
+        """
+        meta = metadata or {}
+        tile_w = meta.get("tileWidth", 512)
+        tile_h = meta.get("tileHeight", 512)
+        img_w = meta.get("imageWidth", tile_w * (2 ** self.tile_zoom))
+        img_h = meta.get("imageHeight", tile_h * (2 ** max(0, self.tile_zoom - 1)))
+
+        zoom, num_x, num_y = self._tile_grid(img_w, img_h, tile_w, tile_h, self.tile_zoom)
+        if zoom != self.tile_zoom:
+            logger.info(
+                f"Zoom capped {self.tile_zoom} -> {zoom} for {pano_id} "
+                f"(image {img_w}x{img_h})"
             )
-            self._viewport_set = True
-            logger.info(f"Viewport set to {self.viewport_size}x{self.viewport_size}")
 
-        views: list[tuple[np.ndarray, float, float, float]] = []
+        total_w = num_x * tile_w
+        total_h = num_y * tile_h
 
-        for pitch in self.pitches:
-            for heading in self.headings:
-                # Set POV and wait for render
-                self.client.set_pov(
-                    self.session_id,
-                    heading=heading,
-                    pitch=pitch,
-                    zoom=self.screenshot_zoom,
-                )
-                self.client.wait_for_stable(self.session_id)
-                # Wait for rendering to fully settle (Google Maps animates POV changes)
-                time.sleep(0.4)
+        # Download tiles in parallel
+        tiles: Dict[Tuple[int, int], Image.Image] = {}
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            futures = {}
+            for ty in range(num_y):
+                for tx in range(num_x):
+                    fut = pool.submit(
+                        self.tiles_client.get_tile, pano_id, zoom, tx, ty
+                    )
+                    futures[fut] = (tx, ty)
 
-                # Take screenshot
-                img_b64 = self.client.screenshot(
-                    self.session_id, quality=self.quality,
-                    fmt=self.screenshot_format,
-                )
-                img_bytes = base64.b64decode(img_b64)
-                img = np.array(Image.open(BytesIO(img_bytes)).convert("RGB"))
-                views.append((img, heading, pitch, self.fov))
+            for fut in as_completed(futures):
+                tx, ty = futures[fut]
+                tile_bytes = fut.result()
+                tiles[(tx, ty)] = Image.open(BytesIO(tile_bytes))
 
-        self.last_views = views
+        # Stitch
+        equirect = Image.new("RGB", (total_w, total_h))
+        for (tx, ty), tile_img in tiles.items():
+            equirect.paste(tile_img, (tx * tile_w, ty * tile_h))
 
-        logger.info(
-            f"Stitching {len(views)} screenshots into "
-            f"{self.equirect_width}x{self.equirect_height} equirectangular"
-        )
-        equirect = perspectives_to_equirect(
-            views, self.equirect_width, self.equirect_height
-        )
-        self.last_equirect_array = equirect
+        # Crop to actual panorama dimensions (edge tiles may have padding)
+        if total_w > img_w or total_h > img_h:
+            equirect = equirect.crop((0, 0, img_w, img_h))
+            total_w, total_h = img_w, img_h
 
         # Save
         safe_pano = re.sub(r"[^A-Za-z0-9_-]", "_", pano_id)
@@ -366,10 +455,10 @@ class ScreenshotCapture:
         os.makedirs(subdir, exist_ok=True)
         filename = f"{safe_pano}_equirect.jpg"
         file_path = os.path.join(subdir, filename)
-        Image.fromarray(equirect).save(file_path, format="JPEG", quality=self.quality)
+        equirect.save(file_path, format="JPEG", quality=self.quality)
 
         rel_path = os.path.relpath(file_path, self.image_root)
-        return rel_path, self.equirect_width, self.equirect_height
+        return rel_path, total_w, total_h, zoom
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +470,7 @@ class CrawlStats:
     panos_visited: int = 0
     tiles_downloaded: int = 0
     errors: int = 0
-    capture_times: list = field(default_factory=list)  # per-pano capture durations (seconds)
+    capture_times: list = field(default_factory=list)
     job_start_time: float = 0.0
     job_end_time: float = 0.0
 
@@ -395,20 +484,18 @@ class CrawlStats:
 
 
 class BFSCrawler:
-    """BFS traversal of Street View panorama graph."""
+    """BFS traversal of Street View panorama graph using Tiles API."""
 
     def __init__(
         self,
-        client: StreetViewHostClient,
-        session_id: str,
+        tiles_client: TilesAPIClient,
         db: CrawlDatabase,
-        screenshot_capture: ScreenshotCapture,
+        tile_capture: TileCapture,
         dry_run: bool = False,
     ) -> None:
-        self.client = client
-        self.session_id = session_id
+        self.tiles_client = tiles_client
         self.db = db
-        self.screenshot_capture = screenshot_capture
+        self.tile_capture = tile_capture
         self.dry_run = dry_run
 
     def crawl(
@@ -416,7 +503,7 @@ class BFSCrawler:
         start_lat: float,
         start_lng: float,
         job_id: int,
-        max_steps: int = 100,
+        max_depth: int = 100,
         visited: Optional[Set[str]] = None,
         initial_queue: Optional[List[Tuple[str, int]]] = None,
     ) -> CrawlStats:
@@ -429,17 +516,20 @@ class BFSCrawler:
         queue: deque[Tuple[str, int]] = deque()
 
         if initial_queue:
-            # Resume mode: use provided frontier
             queue.extend(initial_queue)
         else:
-            # Fresh start: init from coordinates
-            logger.info(f"Initializing panorama at ({start_lat}, {start_lng})")
-            self.client.init(
-                self.session_id, lat=start_lat, lng=start_lng
-            )
-            self.client.wait_for_stable(self.session_id)
-            state = self.client.get_state(self.session_id)
-            start_pano = state.get("panoId")
+            logger.info(f"Looking up panorama at ({start_lat}, {start_lng})")
+            try:
+                meta = self.tiles_client.get_metadata(
+                    lat=start_lat, lng=start_lng
+                )
+            except Exception as e:
+                logger.error(f"No panorama at ({start_lat}, {start_lng}): {e}")
+                self.db.update_job_status(
+                    job_id, "failed", error_message="no_pano_at_start"
+                )
+                return stats
+            start_pano = meta.get("panoId")
             if not start_pano:
                 logger.error("No panorama found at starting coordinates")
                 self.db.update_job_status(
@@ -448,26 +538,24 @@ class BFSCrawler:
                 return stats
             queue.append((start_pano, 0))
 
-        while queue and stats.panos_visited < max_steps:
+        while queue:
             pano_id, depth = queue.popleft()
 
             if pano_id in visited:
                 continue
 
-            # Navigate to this panorama
+            # Fetch metadata from Tiles API
             try:
-                self.client.set_pano(self.session_id, pano_id)
-                self.client.wait_for_stable(self.session_id)
-                state = self.client.get_state(self.session_id)
+                metadata = self.tiles_client.get_metadata(pano_id=pano_id)
             except Exception as e:
-                logger.warning(f"Failed to navigate to pano {pano_id}: {e}")
+                logger.warning(f"Failed to get metadata for {pano_id}: {e}")
                 stats.errors += 1
                 continue
 
             # Handle redirects
-            actual_pano_id = state.get("panoId")
+            actual_pano_id = metadata.get("panoId")
             if not actual_pano_id:
-                logger.warning(f"No panoId in state for {pano_id}")
+                logger.warning(f"No panoId in metadata for {pano_id}")
                 stats.errors += 1
                 continue
 
@@ -480,41 +568,42 @@ class BFSCrawler:
             visited.add(pano_id)
 
             # Save metadata
-            position = state.get("position") or {}
             self.db.insert_panorama(
                 pano_id=pano_id,
-                lat=position.get("lat"),
-                lng=position.get("lng"),
-                date=state.get("date"),
-                metadata_json=json.dumps(state),
+                lat=metadata.get("lat"),
+                lng=metadata.get("lng"),
+                date=metadata.get("date"),
+                metadata_json=json.dumps(metadata),
                 job_id=job_id,
                 bfs_depth=depth,
             )
 
-            # Save links and enqueue neighbours
-            links = state.get("links") or []
+            # Save links and enqueue neighbours within depth limit
+            links = metadata.get("links") or []
             self.db.insert_links(pano_id, links)
-            for link in links:
-                neighbor_id = link.get("panoId")
-                if neighbor_id and neighbor_id not in visited:
-                    queue.append((neighbor_id, depth + 1))
 
-            # Capture equirectangular panorama via browser screenshots
+            if depth < max_depth:
+                for link in links:
+                    neighbor_id = link.get("panoId")
+                    if neighbor_id and neighbor_id not in visited:
+                        queue.append((neighbor_id, depth + 1))
+
+            # Download equirectangular panorama tiles
             if not self.dry_run and not self.db.has_equirect(pano_id):
                 try:
                     t0 = time.time()
-                    rel_path, w, h = self.screenshot_capture.capture_equirectangular(
-                        pano_id
+                    rel_path, w, h, actual_zoom = self.tile_capture.capture_equirectangular(
+                        pano_id, metadata=metadata
                     )
                     capture_dur = time.time() - t0
                     stats.capture_times.append(capture_dur)
-                    self.db.update_equirect(pano_id, rel_path, w, h, 0)
-                    stats.tiles_downloaded += 1
-                    logger.info(
-                        f"Captured {pano_id} in {capture_dur:.1f}s"
+                    self.db.update_equirect(
+                        pano_id, rel_path, w, h, actual_zoom
                     )
+                    stats.tiles_downloaded += 1
+                    logger.info(f"Captured {pano_id} in {capture_dur:.1f}s")
                 except Exception as e:
-                    logger.error(f"Screenshot capture failed for {pano_id}: {e}")
+                    logger.error(f"Tile download failed for {pano_id}: {e}")
                     stats.errors += 1
 
             stats.panos_visited += 1
@@ -524,7 +613,7 @@ class BFSCrawler:
 
             if stats.panos_visited % 10 == 0:
                 logger.info(
-                    f"Progress: {stats.panos_visited}/{max_steps} panos, "
+                    f"Progress: {stats.panos_visited} panos (depth {depth}/{max_depth}), "
                     f"queue={len(queue)}, errors={stats.errors}"
                 )
 
@@ -539,29 +628,34 @@ class BFSCrawler:
 @dataclass
 class CrawlerConfig:
     starting_points: List[Tuple[float, float]] = field(default_factory=list)
-    max_steps: int = 100
+    max_depth: int = 100
     db_path: str = "crawl.db"
     image_root: str = "crawl_images"
-    host_url: Optional[str] = None
     resume: bool = False
     dry_run: bool = False
     api_key: Optional[str] = None
-    equirect_width: int = 4096
-    equirect_height: int = 2048
-    viewport_size: int = DEFAULT_VIEWPORT_SIZE
+    tile_zoom: int = 5
+    tile_workers: int = 8
 
 
 class CrawlerOrchestrator:
-    """Top-level coordinator: manages DB, host session, and BFS crawls."""
+    """Top-level coordinator: manages DB, Tiles API client, and BFS crawls."""
 
     def __init__(self, config: CrawlerConfig) -> None:
         self.config = config
         self.db = CrawlDatabase(config.db_path)
-        self.client = StreetViewHostClient(
-            host_url=config.host_url
+        api_key = config.api_key or os.getenv("GOOGLE_MAPS_API_KEY", "")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_MAPS_API_KEY not provided and not set in environment"
+            )
+        self.tiles_client = TilesAPIClient(api_key)
+        self.tile_capture = TileCapture(
+            tiles_client=self.tiles_client,
+            image_root=config.image_root,
+            tile_zoom=config.tile_zoom,
+            max_workers=config.tile_workers,
         )
-        self._session_id: Optional[str] = None
-        self._screenshot_capture: Optional[ScreenshotCapture] = None
 
     @staticmethod
     def _print_stats(label: str, stats: CrawlStats) -> None:
@@ -569,7 +663,7 @@ class CrawlerOrchestrator:
         mins, secs = divmod(dur, 60)
         logger.info(f"--- {label} ---")
         logger.info(f"  Panoramas visited : {stats.panos_visited}")
-        logger.info(f"  Screenshots taken : {stats.tiles_downloaded}")
+        logger.info(f"  Tiles downloaded  : {stats.tiles_downloaded}")
         logger.info(f"  Errors            : {stats.errors}")
         logger.info(f"  Total time        : {int(mins)}m {secs:.1f}s")
         if stats.capture_times:
@@ -578,43 +672,28 @@ class CrawlerOrchestrator:
             logger.info(f"  Max capture time  : {max(stats.capture_times):.1f}s")
 
     def run(self) -> None:
-        session_id = f"crawler_{int(time.time())}"
-        self._session_id = session_id
-        api_key = self.config.api_key or os.getenv("GOOGLE_MAPS_API_KEY", "")
-        self.client.start(session_id, api_key=api_key)
-
-        self._screenshot_capture = ScreenshotCapture(
-            client=self.client,
-            session_id=session_id,
-            image_root=self.config.image_root,
-            equirect_width=self.config.equirect_width,
-            equirect_height=self.config.equirect_height,
-            viewport_size=self.config.viewport_size,
-        )
-
         all_stats: list[CrawlStats] = []
         run_start = time.time()
 
         try:
-            # Resume interrupted jobs
             if self.config.resume:
-                self._resume_jobs(session_id)
+                self._resume_jobs(all_stats)
 
-            # New starting points
             for lat, lng in self.config.starting_points:
-                job_id = self.db.create_job(lat, lng, self.config.max_steps)
+                job_id = self.db.create_job(lat, lng, self.config.max_depth)
                 logger.info(
                     f"Job {job_id}: crawling from ({lat}, {lng}), "
-                    f"max_steps={self.config.max_steps}"
+                    f"max_depth={self.config.max_depth}"
                 )
                 crawler = BFSCrawler(
-                    self.client,
-                    session_id,
+                    self.tiles_client,
                     self.db,
-                    self._screenshot_capture,
+                    self.tile_capture,
                     dry_run=self.config.dry_run,
                 )
-                stats = crawler.crawl(lat, lng, job_id, self.config.max_steps)
+                stats = crawler.crawl(
+                    lat, lng, job_id, self.config.max_depth
+                )
                 self.db.update_job_status(
                     job_id, "completed", panos_visited=stats.panos_visited
                 )
@@ -625,18 +704,19 @@ class CrawlerOrchestrator:
         except Exception as e:
             logger.exception(f"Crawler failed: {e}")
         finally:
-            # Print overall summary
             if all_stats:
                 total_dur = time.time() - run_start
                 total_panos = sum(s.panos_visited for s in all_stats)
-                total_screenshots = sum(s.tiles_downloaded for s in all_stats)
+                total_tiles = sum(s.tiles_downloaded for s in all_stats)
                 total_errors = sum(s.errors for s in all_stats)
-                all_capture_times = [t for s in all_stats for t in s.capture_times]
+                all_capture_times = [
+                    t for s in all_stats for t in s.capture_times
+                ]
                 mins, secs = divmod(total_dur, 60)
                 logger.info("=== CRAWL SUMMARY ===")
                 logger.info(f"  Starting points   : {len(all_stats)}")
                 logger.info(f"  Total panoramas   : {total_panos}")
-                logger.info(f"  Total screenshots : {total_screenshots}")
+                logger.info(f"  Total tiles DL'd  : {total_tiles}")
                 logger.info(f"  Total errors      : {total_errors}")
                 logger.info(f"  Total time        : {int(mins)}m {secs:.1f}s")
                 if all_capture_times:
@@ -645,16 +725,14 @@ class CrawlerOrchestrator:
                     logger.info(f"  Min capture time  : {min(all_capture_times):.1f}s")
                     logger.info(f"  Max capture time  : {max(all_capture_times):.1f}s")
                 if total_panos > 0 and total_dur > 0:
-                    logger.info(f"  Avg time per pano : {total_dur / total_panos:.1f}s (including BFS overhead)")
+                    logger.info(
+                        f"  Avg time per pano : {total_dur / total_panos:.1f}s"
+                    )
 
-            try:
-                self.client.close_session(session_id)
-            except Exception:
-                pass
-            self.client.close()
+            self.tiles_client.close()
             self.db.close()
 
-    def _resume_jobs(self, session_id: str) -> None:
+    def _resume_jobs(self, all_stats: list[CrawlStats]) -> None:
         jobs = self.db.get_running_jobs()
         if not jobs:
             logger.info("No interrupted jobs to resume.")
@@ -664,37 +742,37 @@ class CrawlerOrchestrator:
             job_id = job["job_id"]
             start_lat = job["start_lat"]
             start_lng = job["start_lng"]
-            max_steps = job["max_steps"]
+            max_depth = job["max_depth"]
 
             visited = self.db.get_visited_pano_ids(job_id)
             frontier = self.db.get_unvisited_neighbors(job_id)
-            remaining = max_steps - len(visited)
+            frontier = [(pid, d) for pid, d in frontier if d <= max_depth]
 
-            if remaining <= 0 or not frontier:
+            if not frontier:
                 self.db.update_job_status(
                     job_id, "completed", panos_visited=len(visited)
                 )
-                logger.info(f"Job {job_id}: already complete ({len(visited)} panos)")
+                logger.info(
+                    f"Job {job_id}: already complete ({len(visited)} panos)"
+                )
                 continue
 
             logger.info(
                 f"Resuming job {job_id} from ({start_lat}, {start_lng}): "
-                f"{len(visited)} visited, {len(frontier)} in frontier, "
-                f"{remaining} remaining"
+                f"{len(visited)} visited, {len(frontier)} in frontier"
             )
 
             crawler = BFSCrawler(
-                self.client,
-                session_id,
+                self.tiles_client,
                 self.db,
-                self._screenshot_capture,
+                self.tile_capture,
                 dry_run=self.config.dry_run,
             )
             stats = crawler.crawl(
                 start_lat,
                 start_lng,
                 job_id,
-                max_steps=remaining,
+                max_depth=max_depth,
                 visited=visited,
                 initial_queue=frontier,
             )
@@ -703,10 +781,8 @@ class CrawlerOrchestrator:
                 "completed",
                 panos_visited=len(visited) + stats.panos_visited,
             )
-            logger.info(
-                f"Job {job_id} resumed and completed: "
-                f"{stats.panos_visited} new panos, {stats.errors} errors"
-            )
+            self._print_stats(f"Job {job_id} (resumed)", stats)
+            all_stats.append(stats)
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +810,6 @@ def _load_coords_file(path: str) -> List[Tuple[float, float]]:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Support both comma and space/tab separation
             parts = re.split(r"[,\s\t]+", line)
             if len(parts) < 2:
                 logger.warning(f"Skipping line {line_num}: '{line}'")
@@ -748,7 +823,7 @@ def _load_coords_file(path: str) -> List[Tuple[float, float]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Street View BFS crawler — download panorama tiles + metadata to local SQLite"
+        description="Street View BFS crawler using Tiles API"
     )
 
     input_group = parser.add_mutually_exclusive_group()
@@ -765,8 +840,8 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--max-steps", type=int, default=100,
-        help="Max BFS steps per starting point (default: 100)",
+        "--max-depth", type=int, default=100,
+        help="Max BFS depth from each starting point (default: 100)",
     )
     parser.add_argument(
         "--db", type=str, default="crawl.db",
@@ -777,16 +852,12 @@ def main() -> None:
         help="Root directory for equirectangular images (default: crawl_images)",
     )
     parser.add_argument(
-        "--host-url", type=str, default=None,
-        help="Playwright host URL (default: $STREETVIEW_HOST_URL)",
+        "--tile-zoom", type=int, default=5,
+        help="Tile zoom level — higher means better quality (default: 5)",
     )
     parser.add_argument(
-        "--equirect-size", type=str, default="4096x2048",
-        help="Equirectangular output size WxH (default: 4096x2048)",
-    )
-    parser.add_argument(
-        "--viewport-size", type=int, default=DEFAULT_VIEWPORT_SIZE,
-        help=f"Square viewport size in pixels for screenshots (default: {DEFAULT_VIEWPORT_SIZE})",
+        "--tile-workers", type=int, default=8,
+        help="Parallel tile download workers per panorama (default: 8)",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -794,7 +865,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="BFS traversal + metadata only, skip screenshot capture",
+        help="BFS traversal + metadata only, skip tile download",
     )
 
     args = parser.parse_args()
@@ -809,22 +880,15 @@ def main() -> None:
     if not starting_points and not args.resume:
         parser.error("Either --coords, --coords-file, or --resume is required")
 
-    # Parse equirect size
-    eq_parts = args.equirect_size.split("x")
-    eq_w = int(eq_parts[0]) if len(eq_parts) >= 1 else 4096
-    eq_h = int(eq_parts[1]) if len(eq_parts) >= 2 else 2048
-
     config = CrawlerConfig(
         starting_points=starting_points,
-        max_steps=args.max_steps,
+        max_depth=args.max_depth,
         db_path=args.db,
         image_root=args.image_dir,
-        host_url=args.host_url,
         resume=args.resume,
         dry_run=args.dry_run,
-        equirect_width=eq_w,
-        equirect_height=eq_h,
-        viewport_size=args.viewport_size,
+        tile_zoom=args.tile_zoom,
+        tile_workers=args.tile_workers,
     )
 
     orchestrator = CrawlerOrchestrator(config)
