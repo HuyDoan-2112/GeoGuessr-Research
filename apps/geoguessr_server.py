@@ -20,6 +20,7 @@ from core.navigation import pure_nav
 from core.tools import nav_tools
 from core.tools.contracts import ToolContext
 from adapters.streetview_js.client import StreetViewHostClient
+from adapters.local_streetview.client import LocalStreetViewClient
 
 logger = logging.getLogger(__name__)
 
@@ -253,18 +254,23 @@ class Engine:
             and self._ctx is not None
         )
 
-    def _set_host_context(self, client: StreetViewHostClient, session_id: str, api_key: Optional[str] = None, url_signing_secret: Optional[str] = None) -> None:
+    def _set_host_context(self, client, session_id: str, api_key: Optional[str] = None, url_signing_secret: Optional[str] = None) -> None:
         self._host_client = client
         self.state.session_id = session_id
+        meta = {
+            "host_client": client,
+            "image_root": self.state.image_root,
+            "image_step": self.state._image_step,
+            "api_key": api_key,
+            "url_signing_secret": url_signing_secret,
+        }
+        local_db = os.getenv("USE_LOCAL_DB")
+        if local_db:
+            meta["local_db_path"] = local_db
+            meta["local_image_root"] = os.getenv("LOCAL_IMAGE_ROOT", "crawl_images")
         self._ctx = ToolContext(
             session_id=session_id,
-            meta={
-                "host_client": client,
-                "image_root": self.state.image_root,
-                "image_step": self.state._image_step,
-                "api_key": api_key,
-                "url_signing_secret": url_signing_secret,
-            },
+            meta=meta,
         )
 
     def _ensure_ctx(self) -> ToolContext:
@@ -351,7 +357,11 @@ class Engine:
     # --- Public actions (called by Flask routes) ---
 
     def connect(self, api_key: str, session_id: Optional[str] = None, url_signing_secret: Optional[str] = None) -> Dict[str, Any]:
-        client = StreetViewHostClient()
+        local_db = os.getenv("USE_LOCAL_DB")
+        if local_db:
+            client = LocalStreetViewClient(db_path=local_db)
+        else:
+            client = StreetViewHostClient()
         if not session_id:
             session_id = f"session_{uuid.uuid4().hex}"
         client.start(session_id, api_key=api_key)

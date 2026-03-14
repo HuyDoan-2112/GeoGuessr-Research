@@ -22,8 +22,12 @@
       pov: { heading: 0, pitch: 0 },
       zoom: 1,
       addressControl: false,
-      linksControl: true,
-      clickToGo: true,
+      linksControl: false,
+      zoomControl: false,
+      panControl: false,
+      fullscreenControl: false,
+      motionTrackingControl: false,
+      clickToGo: false,
       showRoadLabels: false,
     });
     return panorama;
@@ -164,6 +168,24 @@
     return waitForStable();
   }
 
+  // Wait for panorama tiles to finish loading after a POV/pano change.
+  function waitForRender({ timeoutMs = 2000 } = {}) {
+    ensurePanorama();
+    return new Promise((resolve) => {
+      const start = Date.now();
+      // tilesloaded fires when all visible tiles are rendered.
+      const listener = panorama.addListener("tilesloaded", () => {
+        google.maps.event.removeListener(listener);
+        resolve({ rendered: true, elapsed: Date.now() - start });
+      });
+      // Timeout fallback
+      setTimeout(() => {
+        google.maps.event.removeListener(listener);
+        resolve({ rendered: false, elapsed: Date.now() - start, timedOut: true });
+      }, timeoutMs);
+    });
+  }
+
   // Update POV (and optionally zoom) without changing pano.
   function setPov({ heading, pitch, zoom } = {}) {
     ensurePanorama();
@@ -259,6 +281,7 @@
     setPano,
     setPosition,
     waitForStable,
+    waitForRender,
   };
 
   waitForMaps();

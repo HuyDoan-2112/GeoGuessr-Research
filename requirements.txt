@@ -10,3 +10,4 @@ mypy
 flask
 waitress
 tenacity
+numpy

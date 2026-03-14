@@ -33,7 +33,9 @@ function getFileUrl() {
 
 async function warmPage() {
   const browser = await ensureBrowser();
-  const context = await browser.newContext();
+  const vpW = parseInt(process.env.VIEWPORT_WIDTH || "1920", 10);
+  const vpH = parseInt(process.env.VIEWPORT_HEIGHT || "1920", 10);
+  const context = await browser.newContext({ viewport: { width: vpW, height: vpH } });
   const page = await context.newPage();
   await page.goto(getFileUrl(), { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => window.__SV__ && window.__SV__.ready === true);
@@ -156,6 +158,36 @@ const handlers = {
 
   async waitForStable(session, params) {
     return callBridge(session, "waitForStable", params);
+  },
+
+  async waitForRender(session, params) {
+    return callBridge(session, "waitForRender", params);
+  },
+
+  async screenshot(session, params) {
+    const quality = (params && params.quality) || 85;
+    const format = (params && params.format) || "jpeg";
+    // Hide any residual Google Maps UI overlays for a clean capture
+    await session.page.evaluate(() => {
+      const s = document.createElement("style");
+      s.id = "_sv_hide";
+      s.textContent =
+        ".gmnoprint, .gm-bundled-control, .gm-style-cc, " +
+        ".gm-compass, .gm-sv-label, .gm-iv-address, " +
+        ".gm-style > div > div > div[style*='z-index'] { " +
+        "display: none !important; }";
+      document.head.appendChild(s);
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    const opts = { type: format, fullPage: false };
+    if (format === "jpeg") opts.quality = quality;
+    const buf = await session.page.screenshot(opts);
+    // Restore controls
+    await session.page.evaluate(() => {
+      const s = document.getElementById("_sv_hide");
+      if (s) s.remove();
+    });
+    return { imageBase64: buf.toString("base64") };
   },
 
   async closeSession(session) {

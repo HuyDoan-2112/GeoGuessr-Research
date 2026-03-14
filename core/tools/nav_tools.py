@@ -8,6 +8,7 @@ from typing import Any, Dict
 from core.navigation import pure_nav
 from core.tools.contracts import ToolContext, ToolResult
 from core.utils.image_pipeline import capture_state_image_base64
+from core.utils.local_image_utils import local_fetch_image
 from adapters.streetview_js.client import StreetViewHostClient
 from core.exceptions import MissingContextError
 
@@ -58,6 +59,11 @@ class NavTools:
     def capture_image(self, state: Dict[str, Any]) -> tuple[str | None, str | None]:
         if self.ctx.meta.get("capture_images") is False:
             return None, None
+
+        local_db = self.ctx.meta.get("local_db_path")
+        if local_db:
+            return self._capture_local(state, local_db)
+
         session_id = self.ctx.session_id or f"session_{int(time.time())}"
         image_root = self.ctx.meta.get("image_root") or os.getenv(
             "IMAGE_OUTPUT_DIR", "images"
@@ -70,6 +76,24 @@ class NavTools:
         )
         self.ctx.meta["image_step"] = step + 1
         return image_base64, path
+
+    def _capture_local(self, state: Dict[str, Any], db_path: str) -> tuple[str | None, str | None]:
+        """Render a perspective view from a local equirectangular panorama."""
+        import base64
+        pano_id = state.get("panoId")
+        if not pano_id:
+            return None, None
+        pov = state.get("pov") or {}
+        image_root = self.ctx.meta.get("local_image_root", "crawl_images")
+        img_bytes = local_fetch_image(
+            pano_id=pano_id,
+            heading=pov.get("heading", 0.0),
+            pitch=pov.get("pitch", 0.0),
+            zoom=pov.get("zoom", 1.0),
+            db_path=db_path,
+            image_root=image_root,
+        )
+        return base64.b64encode(img_bytes).decode("utf-8"), None
 
     def available_moves_from_state(self, state: Dict[str, Any]) -> list[str]:
         try:

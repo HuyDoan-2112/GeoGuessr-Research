@@ -176,6 +176,16 @@ class StreetViewHostClient:
             {"timeoutMs": timeoutMs, "debounceMs": debounceMs},
         )
 
+    def screenshot(self, session_id: str, quality: int = 85, fmt: str = "jpeg") -> str:
+        """Take a screenshot of the current Street View and return base64."""
+        if not session_id:
+            raise MissingContextError("session_id")
+        result = self._post(
+            f"/session/{session_id}/screenshot",
+            {"quality": quality, "format": fmt},
+        )
+        return result.get("imageBase64", "")
+
     def close_session(self, session_id: str) -> Any:
         if not session_id:
             raise MissingContextError("session_id")
