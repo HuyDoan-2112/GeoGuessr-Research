@@ -344,6 +344,17 @@ class CrawlDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def find_completed_job(
+        self, lat: float, lng: float
+    ) -> Optional[Dict[str, Any]]:
+        """Find the most recent completed job for the given starting coords."""
+        row = self._conn.execute(
+            "SELECT * FROM crawl_jobs WHERE start_lat = ? AND start_lng = ? "
+            "AND status = 'completed' ORDER BY job_id DESC LIMIT 1",
+            (lat, lng),
+        ).fetchone()
+        return dict(row) if row else None
+
     def get_unvisited_neighbors(self, job_id: int) -> List[Tuple[str, int]]:
         """For resume: find (pano_id, depth+1) of unvisited neighbours."""
         rows = self._conn.execute(
@@ -680,25 +691,68 @@ class CrawlerOrchestrator:
                 self._resume_jobs(all_stats)
 
             for lat, lng in self.config.starting_points:
-                job_id = self.db.create_job(lat, lng, self.config.max_depth)
-                logger.info(
-                    f"Job {job_id}: crawling from ({lat}, {lng}), "
-                    f"max_depth={self.config.max_depth}"
-                )
-                crawler = BFSCrawler(
-                    self.tiles_client,
-                    self.db,
-                    self.tile_capture,
-                    dry_run=self.config.dry_run,
-                )
-                stats = crawler.crawl(
-                    lat, lng, job_id, self.config.max_depth
-                )
-                self.db.update_job_status(
-                    job_id, "completed", panos_visited=stats.panos_visited
-                )
-                self._print_stats(f"Job {job_id} ({lat}, {lng})", stats)
-                all_stats.append(stats)
+                existing = self.db.find_completed_job(lat, lng)
+                if existing:
+                    job_id = existing["job_id"]
+                    visited = self.db.get_visited_pano_ids(job_id)
+                    frontier = self.db.get_unvisited_neighbors(job_id)
+                    frontier = [
+                        (pid, d)
+                        for pid, d in frontier
+                        if d <= self.config.max_depth
+                    ]
+                    if not frontier:
+                        logger.info(
+                            f"Skipping ({lat}, {lng}): job {job_id} already "
+                            f"complete with no unvisited neighbors within depth {self.config.max_depth}"
+                        )
+                        continue
+                    logger.info(
+                        f"Continuing job {job_id} at ({lat}, {lng}): "
+                        f"{len(visited)} visited, {len(frontier)} in frontier"
+                    )
+                    self.db.update_job_status(
+                        job_id, "running",
+                        max_depth=self.config.max_depth,
+                    )
+                    crawler = BFSCrawler(
+                        self.tiles_client,
+                        self.db,
+                        self.tile_capture,
+                        dry_run=self.config.dry_run,
+                    )
+                    stats = crawler.crawl(
+                        lat, lng, job_id,
+                        max_depth=self.config.max_depth,
+                        visited=visited,
+                        initial_queue=frontier,
+                    )
+                    self.db.update_job_status(
+                        job_id, "completed",
+                        panos_visited=len(visited) + stats.panos_visited,
+                    )
+                    self._print_stats(f"Job {job_id} (continued)", stats)
+                    all_stats.append(stats)
+                else:
+                    job_id = self.db.create_job(lat, lng, self.config.max_depth)
+                    logger.info(
+                        f"Job {job_id}: crawling from ({lat}, {lng}), "
+                        f"max_depth={self.config.max_depth}"
+                    )
+                    crawler = BFSCrawler(
+                        self.tiles_client,
+                        self.db,
+                        self.tile_capture,
+                        dry_run=self.config.dry_run,
+                    )
+                    stats = crawler.crawl(
+                        lat, lng, job_id, self.config.max_depth
+                    )
+                    self.db.update_job_status(
+                        job_id, "completed", panos_visited=stats.panos_visited
+                    )
+                    self._print_stats(f"Job {job_id} ({lat}, {lng})", stats)
+                    all_stats.append(stats)
         except KeyboardInterrupt:
             logger.info("Interrupted. Progress saved. Use --resume to continue.")
         except Exception as e:
