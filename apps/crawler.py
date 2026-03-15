@@ -22,7 +22,6 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
@@ -34,7 +33,6 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from tenacity import (
     retry,
-    stop_after_attempt,
     wait_exponential_jitter,
     retry_if_exception,
     before_sleep_log,
@@ -46,6 +44,7 @@ sys.path.insert(0, str(ROOT))
 from core.utils.retry import is_retryable_http_error
 
 logger = logging.getLogger(__name__)
+
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +90,9 @@ class TilesAPIClient:
             return self._token
 
     @retry(
-        stop=stop_after_attempt(4),
-        wait=wait_exponential_jitter(initial=1, max=30, jitter=2),
+        wait=wait_exponential_jitter(initial=1, max=120, jitter=2),
         retry=retry_if_exception(is_retryable_http_error),
         before_sleep=before_sleep_log(logger, logging.WARNING),
-        reraise=True,
     )
     def get_metadata(
         self,
@@ -122,11 +119,9 @@ class TilesAPIClient:
         return resp.json()
 
     @retry(
-        stop=stop_after_attempt(4),
-        wait=wait_exponential_jitter(initial=0.5, max=15, jitter=1),
+        wait=wait_exponential_jitter(initial=1, max=120, jitter=2),
         retry=retry_if_exception(is_retryable_http_error),
         before_sleep=before_sleep_log(logger, logging.WARNING),
-        reraise=True,
     )
     def get_tile(self, pano_id: str, zoom: int, x: int, y: int) -> bytes:
         """Download a single tile."""
@@ -384,13 +379,11 @@ class TileCapture:
         image_root: str,
         tile_zoom: int = 5,
         quality: int = 95,
-        max_workers: int = 8,
     ) -> None:
         self.tiles_client = tiles_client
         self.image_root = image_root
         self.tile_zoom = tile_zoom
         self.quality = quality
-        self.max_workers = max_workers
 
     @staticmethod
     def _tile_grid(
@@ -434,20 +427,11 @@ class TileCapture:
         total_w = num_x * tile_w
         total_h = num_y * tile_h
 
-        # Download tiles in parallel
+        # Download tiles sequentially (respects rate limiter)
         tiles: Dict[Tuple[int, int], Image.Image] = {}
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futures = {}
-            for ty in range(num_y):
-                for tx in range(num_x):
-                    fut = pool.submit(
-                        self.tiles_client.get_tile, pano_id, zoom, tx, ty
-                    )
-                    futures[fut] = (tx, ty)
-
-            for fut in as_completed(futures):
-                tx, ty = futures[fut]
-                tile_bytes = fut.result()
+        for ty in range(num_y):
+            for tx in range(num_x):
+                tile_bytes = self.tiles_client.get_tile(pano_id, zoom, tx, ty)
                 tiles[(tx, ty)] = Image.open(BytesIO(tile_bytes))
 
         # Stitch
@@ -646,7 +630,6 @@ class CrawlerConfig:
     dry_run: bool = False
     api_key: Optional[str] = None
     tile_zoom: int = 5
-    tile_workers: int = 8
 
 
 class CrawlerOrchestrator:
@@ -665,7 +648,6 @@ class CrawlerOrchestrator:
             tiles_client=self.tiles_client,
             image_root=config.image_root,
             tile_zoom=config.tile_zoom,
-            max_workers=config.tile_workers,
         )
 
     @staticmethod
@@ -910,10 +892,6 @@ def main() -> None:
         help="Tile zoom level — higher means better quality (default: 5)",
     )
     parser.add_argument(
-        "--tile-workers", type=int, default=8,
-        help="Parallel tile download workers per panorama (default: 8)",
-    )
-    parser.add_argument(
         "--resume", action="store_true",
         help="Resume interrupted crawl jobs from the database",
     )
@@ -942,7 +920,6 @@ def main() -> None:
         resume=args.resume,
         dry_run=args.dry_run,
         tile_zoom=args.tile_zoom,
-        tile_workers=args.tile_workers,
     )
 
     orchestrator = CrawlerOrchestrator(config)
