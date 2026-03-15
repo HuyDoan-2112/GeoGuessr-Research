@@ -57,8 +57,9 @@ TILES_API_BASE = "https://tile.googleapis.com/v1"
 class TilesAPIClient:
     """Client for the Google Maps Platform Street View Tiles API."""
 
-    def __init__(self, api_key: str, max_concurrent: int = 16) -> None:
+    def __init__(self, api_key: str, max_concurrent: int = 16, request_delay: float = 0.1) -> None:
         self.api_key = api_key
+        self._request_delay = request_delay
         self._http = requests.Session()
         adapter = HTTPAdapter(
             pool_connections=max_concurrent, pool_maxsize=max_concurrent
@@ -112,6 +113,7 @@ class TilesAPIClient:
             params["radius"] = radius
         else:
             raise ValueError("Either pano_id or (lat, lng) must be provided")
+        time.sleep(self._request_delay)
         resp = self._http.get(
             f"{TILES_API_BASE}/streetview/metadata", params=params
         )
@@ -126,6 +128,7 @@ class TilesAPIClient:
     def get_tile(self, pano_id: str, zoom: int, x: int, y: int) -> bytes:
         """Download a single tile."""
         token = self._ensure_token()
+        time.sleep(self._request_delay)
         resp = self._http.get(
             f"{TILES_API_BASE}/streetview/tiles/{zoom}/{x}/{y}",
             params={
