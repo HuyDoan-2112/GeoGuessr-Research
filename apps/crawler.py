@@ -258,6 +258,14 @@ class CrawlDatabase:
         ).fetchone()
         return row is not None and row["equirect_path"] is not None
 
+    def get_failed_downloads(self) -> List[Dict[str, Any]]:
+        """Return panoramas that have metadata but no equirectangular image."""
+        rows = self._conn.execute(
+            "SELECT pano_id, metadata_json FROM panoramas "
+            "WHERE equirect_path IS NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def insert_panorama(
         self,
         pano_id: str,
@@ -342,13 +350,13 @@ class CrawlDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def find_completed_job(
+    def find_existing_job(
         self, lat: float, lng: float
     ) -> Optional[Dict[str, Any]]:
-        """Find the most recent completed job for the given starting coords."""
+        """Find the most recent job for the given starting coords, regardless of status."""
         row = self._conn.execute(
             "SELECT * FROM crawl_jobs WHERE start_lat = ? AND start_lng = ? "
-            "AND status = 'completed' ORDER BY job_id DESC LIMIT 1",
+            "ORDER BY job_id DESC LIMIT 1",
             (lat, lng),
         ).fetchone()
         return dict(row) if row else None
@@ -630,6 +638,7 @@ class CrawlerConfig:
     db_path: str = "crawl.db"
     image_root: str = "crawl_images"
     resume: bool = False
+    retry_failed: bool = False
     dry_run: bool = False
     api_key: Optional[str] = None
     tile_zoom: int = 5
@@ -672,11 +681,17 @@ class CrawlerOrchestrator:
         run_start = time.time()
 
         try:
+            if self.config.retry_failed:
+                stats = self._retry_failed_downloads()
+                if stats.tiles_downloaded or stats.errors:
+                    self._print_stats("Retry failed downloads", stats)
+                    all_stats.append(stats)
+
             if self.config.resume:
                 self._resume_jobs(all_stats)
 
             for lat, lng in self.config.starting_points:
-                existing = self.db.find_completed_job(lat, lng)
+                existing = self.db.find_existing_job(lat, lng)
                 if existing:
                     job_id = existing["job_id"]
                     visited = self.db.get_visited_pano_ids(job_id)
@@ -770,6 +785,38 @@ class CrawlerOrchestrator:
 
             self.tiles_client.close()
             self.db.close()
+
+    def _retry_failed_downloads(self) -> CrawlStats:
+        """Re-download tiles for panoramas where equirect_path is NULL."""
+        failed = self.db.get_failed_downloads()
+        if not failed:
+            logger.info("No failed downloads to retry.")
+            return CrawlStats()
+
+        logger.info(f"Retrying {len(failed)} failed tile downloads...")
+        stats = CrawlStats()
+        stats.job_start_time = time.time()
+
+        for row in failed:
+            pano_id = row["pano_id"]
+            metadata = json.loads(row["metadata_json"])
+            try:
+                t0 = time.time()
+                rel_path, w, h, actual_zoom = self.tile_capture.capture_equirectangular(
+                    pano_id, metadata=metadata
+                )
+                capture_dur = time.time() - t0
+                stats.capture_times.append(capture_dur)
+                self.db.update_equirect(pano_id, rel_path, w, h, actual_zoom)
+                stats.tiles_downloaded += 1
+                logger.info(f"Retry OK: {pano_id} in {capture_dur:.1f}s")
+            except Exception as e:
+                logger.error(f"Retry failed for {pano_id}: {e}")
+                stats.errors += 1
+
+        stats.job_end_time = time.time()
+        stats.panos_visited = len(failed)
+        return stats
 
     def _resume_jobs(self, all_stats: list[CrawlStats]) -> None:
         jobs = self.db.get_running_jobs()
@@ -899,6 +946,10 @@ def main() -> None:
         help="Resume interrupted crawl jobs from the database",
     )
     parser.add_argument(
+        "--retry-failed", action="store_true",
+        help="Re-download tiles for panoramas that failed previously",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="BFS traversal + metadata only, skip tile download",
     )
@@ -912,8 +963,8 @@ def main() -> None:
     elif args.coords_file:
         starting_points = _load_coords_file(args.coords_file)
 
-    if not starting_points and not args.resume:
-        parser.error("Either --coords, --coords-file, or --resume is required")
+    if not starting_points and not args.resume and not args.retry_failed:
+        parser.error("Either --coords, --coords-file, --resume, or --retry-failed is required")
 
     config = CrawlerConfig(
         starting_points=starting_points,
@@ -921,6 +972,7 @@ def main() -> None:
         db_path=args.db,
         image_root=args.image_dir,
         resume=args.resume,
+        retry_failed=args.retry_failed,
         dry_run=args.dry_run,
         tile_zoom=args.tile_zoom,
     )
