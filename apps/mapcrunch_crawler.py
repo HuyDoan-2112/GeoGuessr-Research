@@ -1180,7 +1180,8 @@ def main() -> None:
         help="Heading angles in degrees (default: every 10 deg from 0-350)",
     )
     parser.add_argument(
-        "--pitches", nargs="+", type=float, default=[float(i) for i in range(-40, 50, 10)],
+        # @HuanzhiMao TODO: Change to -40 to 50?
+        "--pitches", nargs="+", type=float, default=[float(i) for i in range(-30, 40, 10)],
         help="Pitch angles in degrees (default: every 10 deg from -40 to +40)",
     )
     parser.add_argument(

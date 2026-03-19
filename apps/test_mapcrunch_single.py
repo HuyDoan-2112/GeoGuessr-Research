@@ -36,8 +36,8 @@ IMAGE_ROOT = "test_mapcrunch_single_images"
 
 # Modest set of angles for testing
 HEADINGS = [0.0, 90.0, 180.0, 270.0]
-PITCHES = [-20.0, 0.0, 20.0]
-ZOOMS = [0.0, 1.0, 2.0]
+PITCHES = [float(i) for i in range(-40, 50, 10)]
+ZOOMS = [0.0, 1.0, 1.5, 2.0, 3.0]
 
 
 class CountingTilesClient(TilesAPIClient):
@@ -72,7 +72,7 @@ def run_bfs(api_key: str) -> Tuple[int, CaptureDatabase, int]:
     job_id = db.create_job(LAT, LNG, max_depth=1)
     # depth=1 so we discover the start pano AND record its neighbor links,
     # but we only capture screenshots for depth-0 panos.
-    n = bfs_discover(tiles, db, LAT, LNG, job_id, max_depth=1)
+    n = bfs_discover(tiles, db, LAT, LNG, job_id, max_depth=1, api_key=api_key)
     api_calls = tiles.api_calls
     tiles.close()
     logger.info("BFS discovered %d panoramas (%d API calls)", n, api_calls)
