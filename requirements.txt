@@ -11,3 +11,4 @@ flask
 waitress
 tenacity
 numpy
+playwright
