@@ -39,18 +39,38 @@ PITCHES = [-20.0, 0.0, 20.0]
 ZOOMS = [0.0, 1.0, 2.0]
 
 
-def run_bfs(api_key: str) -> Tuple[int, CaptureDatabase]:
-    """BFS discover only the starting pano (depth=0) to collect neighbor info."""
+class CountingTilesClient(TilesAPIClient):
+    """Thin wrapper that counts API calls."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.api_calls = 0
+
+    def get_metadata(self, **kwargs):
+        self.api_calls += 1
+        return super().get_metadata(**kwargs)
+
+    def get_tile(self, *args, **kwargs):
+        self.api_calls += 1
+        return super().get_tile(*args, **kwargs)
+
+
+def run_bfs(api_key: str) -> Tuple[int, CaptureDatabase, int]:
+    """BFS discover only the starting pano (depth=0) to collect neighbor info.
+
+    Returns (job_id, db, api_call_count).
+    """
     db = CaptureDatabase(DB_PATH)
-    tiles = TilesAPIClient(api_key)
+    tiles = CountingTilesClient(api_key)
 
     job_id = db.create_job(LAT, LNG, max_depth=1)
     # depth=1 so we discover the start pano AND record its neighbor links,
     # but we only capture screenshots for depth-0 panos.
     n = bfs_discover(tiles, db, LAT, LNG, job_id, max_depth=1)
+    api_calls = tiles.api_calls
     tiles.close()
-    logger.info("BFS discovered %d panoramas", n)
-    return job_id, db
+    logger.info("BFS discovered %d panoramas (%d API calls)", n, api_calls)
+    return job_id, db, api_calls
 
 
 def print_neighbor_info(db: CaptureDatabase, job_id: int) -> None:
@@ -284,10 +304,10 @@ async def main() -> None:
     # Phase 1: BFS discovery (depth=1 to get neighbor links)
     print("Phase 1: BFS Discovery...")
     t0 = _time.time()
-    job_id, db = run_bfs(api_key)
+    job_id, db, api_calls = run_bfs(api_key)
     dt = _time.time() - t0
     timings.append(("BFS Discovery", dt))
-    print(f"  -> {dt:.1f}s")
+    print(f"  -> {dt:.1f}s ({api_calls} Google API calls)")
 
     # Show neighbor info
     print_neighbor_info(db, job_id)
@@ -314,8 +334,10 @@ async def main() -> None:
     # Timing summary
     total = _time.time() - t_total
     print(f"\n{'='*40}")
-    print("Timing Summary")
+    print("Summary")
     print(f"{'='*40}")
+    print(f"  Google API calls: {api_calls}")
+    print()
     for name, dt in timings:
         print(f"  {name:<25} {dt:6.1f}s")
     print(f"  {'─'*32}")
