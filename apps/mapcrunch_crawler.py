@@ -556,7 +556,7 @@ class CaptureConfig:
     starting_points: List[Tuple[float, float]] = field(default_factory=list)
     headings: List[float] = field(default_factory=lambda: [0.0])
     pitches: List[float] = field(default_factory=lambda: [0.0])
-    zooms: List[float] = field(default_factory=lambda: [0.0])
+    zooms: List[float] = field(default_factory=lambda: [0.0, 1.0, 1.5, 2.0, 3.0])
     db_path: str = "mapcrunch_captures.db"
     image_root: str = "mapcrunch_images"
     viewport_width: int = 1920
@@ -717,8 +717,8 @@ def main() -> None:
         help="Pitch angles in degrees (default: 0)",
     )
     parser.add_argument(
-        "--zooms", nargs="+", type=float, default=[0.0],
-        help="Zoom levels (default: 0)",
+        "--zooms", nargs="+", type=float, default=[0.0, 1.0, 1.5, 2.0, 3.0],
+        help="Zoom levels (default: 0 1 1.5 2 3)",
     )
     parser.add_argument(
         "--db", type=str, default="mapcrunch_captures.db",
