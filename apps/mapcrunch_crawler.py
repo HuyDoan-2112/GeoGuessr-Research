@@ -1,15 +1,21 @@
-"""MapCrunch Street View screenshot capture — clean panorama images via headless Chrome.
+"""MapCrunch Street View screenshot capture with BFS neighbor discovery.
 
-Uses Playwright to visit MapCrunch, remove all overlay UI, and capture
-clean Street View screenshots at specified coordinates and view angles.
+Two-phase pipeline:
+  1. BFS Discovery — uses Google Tiles API to find all panoramas reachable
+     within --max-depth steps from each starting coordinate.  Stores panorama
+     metadata and neighbor links in SQLite.
+  2. Screenshot Capture — for every discovered panorama, opens MapCrunch in
+     headless Chrome and captures clean Street View screenshots at each
+     heading / pitch / zoom combination.
 
 Usage:
     python -m apps.mapcrunch_crawler --coords 29.958574,-90.065712
     python -m apps.mapcrunch_crawler --coords-file locations.csv
     python -m apps.mapcrunch_crawler --coords 37.7749,-122.4194 --headings 0 90 180 270
+    python -m apps.mapcrunch_crawler --resume --db mapcrunch.db
 
 Prerequisites:
-    pip install playwright
+    pip install playwright requests tenacity
     python -m playwright install chromium
 """
 
@@ -24,13 +30,16 @@ import re
 import sqlite3
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from apps.crawler import TilesAPIClient
 
 logger = logging.getLogger(__name__)
 
@@ -285,29 +294,66 @@ DOM_CLEANUP_JS = """() => {
 
 
 # ---------------------------------------------------------------------------
-# CaptureDatabase
+# Database
 # ---------------------------------------------------------------------------
 
 class CaptureDatabase:
-    """SQLite storage for MapCrunch screenshot metadata."""
+    """SQLite storage for BFS graph + screenshot capture tracking."""
 
     SCHEMA = """
+    CREATE TABLE IF NOT EXISTS crawl_jobs (
+        job_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        start_lat       REAL NOT NULL,
+        start_lng       REAL NOT NULL,
+        max_depth       INTEGER NOT NULL DEFAULT 50,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        started_at      TEXT,
+        completed_at    TEXT,
+        panos_discovered INTEGER NOT NULL DEFAULT 0,
+        panos_captured  INTEGER NOT NULL DEFAULT 0,
+        error_message   TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS panoramas (
+        pano_id         TEXT PRIMARY KEY,
+        lat             REAL,
+        lng             REAL,
+        date            TEXT,
+        metadata_json   TEXT,
+        job_id          INTEGER,
+        bfs_depth       INTEGER,
+        capture_status  TEXT NOT NULL DEFAULT 'pending',
+        FOREIGN KEY (job_id) REFERENCES crawl_jobs(job_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS panorama_links (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_pano_id    TEXT NOT NULL,
+        to_pano_id      TEXT NOT NULL,
+        heading         REAL NOT NULL,
+        description     TEXT,
+        link_date       TEXT,
+        UNIQUE(from_pano_id, to_pano_id)
+    );
+
     CREATE TABLE IF NOT EXISTS captures (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        pano_id         TEXT,
-        lat             REAL NOT NULL,
-        lng             REAL NOT NULL,
-        heading         REAL NOT NULL DEFAULT 0,
-        pitch           REAL NOT NULL DEFAULT 0,
-        zoom            REAL NOT NULL DEFAULT 0,
+        pano_id         TEXT NOT NULL,
+        heading         REAL NOT NULL,
+        pitch           REAL NOT NULL,
+        zoom            REAL NOT NULL,
         image_path      TEXT,
         width           INTEGER,
         height          INTEGER,
         captured_at     TEXT,
-        metadata_json   TEXT
+        UNIQUE(pano_id, heading, pitch, zoom)
     );
+
+    CREATE INDEX IF NOT EXISTS idx_panoramas_job ON panoramas(job_id);
+    CREATE INDEX IF NOT EXISTS idx_panoramas_status ON panoramas(capture_status);
+    CREATE INDEX IF NOT EXISTS idx_links_from ON panorama_links(from_pano_id);
+    CREATE INDEX IF NOT EXISTS idx_links_to ON panorama_links(to_pano_id);
     CREATE INDEX IF NOT EXISTS idx_captures_pano ON captures(pano_id);
-    CREATE INDEX IF NOT EXISTS idx_captures_coords ON captures(lat, lng);
     """
 
     def __init__(self, db_path: str) -> None:
@@ -320,44 +366,285 @@ class CaptureDatabase:
     def close(self) -> None:
         self._conn.close()
 
+    # -- crawl_jobs --
+
+    def create_job(self, lat: float, lng: float, max_depth: int) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.execute(
+            "INSERT INTO crawl_jobs (start_lat, start_lng, max_depth, status, started_at) "
+            "VALUES (?, ?, ?, 'running', ?)",
+            (lat, lng, max_depth, now),
+        )
+        self._conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def update_job(self, job_id: int, **kwargs: Any) -> None:
+        if not kwargs:
+            return
+        sets = []
+        vals: list = []
+        for k, v in kwargs.items():
+            sets.append(f"{k} = ?")
+            vals.append(v)
+        vals.append(job_id)
+        self._conn.execute(
+            f"UPDATE crawl_jobs SET {', '.join(sets)} WHERE job_id = ?", vals,
+        )
+        self._conn.commit()
+
+    def find_existing_job(self, lat: float, lng: float) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM crawl_jobs WHERE start_lat = ? AND start_lng = ? "
+            "ORDER BY job_id DESC LIMIT 1",
+            (lat, lng),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_running_jobs(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM crawl_jobs WHERE status IN ('running', 'discovering', 'capturing')"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- panoramas --
+
+    def has_panorama(self, pano_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM panoramas WHERE pano_id = ?", (pano_id,)
+        ).fetchone()
+        return row is not None
+
+    def insert_panorama(
+        self,
+        pano_id: str,
+        lat: Optional[float],
+        lng: Optional[float],
+        date: Optional[str],
+        metadata_json: str,
+        job_id: int,
+        bfs_depth: int,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO panoramas "
+            "(pano_id, lat, lng, date, metadata_json, job_id, bfs_depth) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (pano_id, lat, lng, date, metadata_json, job_id, bfs_depth),
+        )
+        self._conn.commit()
+
+    def mark_pano_captured(self, pano_id: str) -> None:
+        self._conn.execute(
+            "UPDATE panoramas SET capture_status = 'done' WHERE pano_id = ?",
+            (pano_id,),
+        )
+        self._conn.commit()
+
+    def mark_pano_failed(self, pano_id: str) -> None:
+        self._conn.execute(
+            "UPDATE panoramas SET capture_status = 'failed' WHERE pano_id = ?",
+            (pano_id,),
+        )
+        self._conn.commit()
+
+    def get_pending_panos(self, job_id: int) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM panoramas WHERE job_id = ? AND capture_status = 'pending' "
+            "ORDER BY bfs_depth",
+            (job_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_visited_pano_ids(self, job_id: int) -> Set[str]:
+        rows = self._conn.execute(
+            "SELECT pano_id FROM panoramas WHERE job_id = ?", (job_id,)
+        ).fetchall()
+        return {r["pano_id"] for r in rows}
+
+    def get_unvisited_neighbors(self, job_id: int) -> List[Tuple[str, int]]:
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT pl.to_pano_id, p.bfs_depth + 1 AS next_depth
+            FROM panorama_links pl
+            JOIN panoramas p ON p.pano_id = pl.from_pano_id AND p.job_id = ?
+            WHERE pl.to_pano_id NOT IN (
+                SELECT pano_id FROM panoramas WHERE job_id = ?
+            )
+            """,
+            (job_id, job_id),
+        ).fetchall()
+        return [(r["to_pano_id"], r["next_depth"]) for r in rows]
+
+    def count_panos(self, job_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS cnt FROM panoramas WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+    # -- links --
+
+    def insert_links(self, from_pano_id: str, links: List[Dict[str, Any]]) -> None:
+        rows = []
+        for link in links:
+            to_id = link.get("panoId")
+            if not to_id:
+                continue
+            rows.append((
+                from_pano_id,
+                to_id,
+                link.get("heading", 0.0),
+                link.get("description", link.get("text", "")),
+                link.get("date"),
+            ))
+        if not rows:
+            return
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO panorama_links "
+            "(from_pano_id, to_pano_id, heading, description, link_date) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        self._conn.commit()
+
+    # -- captures --
+
     def has_capture(
-        self, lat: float, lng: float, heading: float, pitch: float, zoom: float,
+        self, pano_id: str, heading: float, pitch: float, zoom: float,
     ) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM captures "
-            "WHERE lat=? AND lng=? AND heading=? AND pitch=? AND zoom=? "
+            "WHERE pano_id=? AND heading=? AND pitch=? AND zoom=? "
             "AND image_path IS NOT NULL",
-            (lat, lng, heading, pitch, zoom),
+            (pano_id, heading, pitch, zoom),
         ).fetchone()
         return row is not None
 
     def insert_capture(
         self,
-        pano_id: Optional[str],
-        lat: float,
-        lng: float,
+        pano_id: str,
         heading: float,
         pitch: float,
         zoom: float,
         image_path: str,
         width: int,
         height: int,
-        metadata_json: Optional[str] = None,
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
         cur = self._conn.execute(
-            "INSERT INTO captures (pano_id, lat, lng, heading, pitch, zoom, "
-            "image_path, width, height, captured_at, metadata_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (pano_id, lat, lng, heading, pitch, zoom,
-             image_path, width, height, now, metadata_json),
+            "INSERT OR REPLACE INTO captures "
+            "(pano_id, heading, pitch, zoom, image_path, width, height, captured_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (pano_id, heading, pitch, zoom, image_path, width, height, now),
         )
         self._conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
 
+    def count_captures(self, pano_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS cnt FROM captures WHERE pano_id = ? AND image_path IS NOT NULL",
+            (pano_id,),
+        ).fetchone()
+        return row["cnt"] if row else 0
+
 
 # ---------------------------------------------------------------------------
-# MapCrunchCapture
+# BFS Discovery (Phase 1)
+# ---------------------------------------------------------------------------
+
+def bfs_discover(
+    tiles_client: TilesAPIClient,
+    db: CaptureDatabase,
+    start_lat: float,
+    start_lng: float,
+    job_id: int,
+    max_depth: int,
+    visited: Optional[Set[str]] = None,
+    initial_queue: Optional[List[Tuple[str, int]]] = None,
+) -> int:
+    """BFS traverse the Street View graph, storing metadata + links.
+
+    Returns the number of newly discovered panoramas.
+    """
+    if visited is None:
+        visited = set()
+
+    queue: deque[Tuple[str, int]] = deque()
+    discovered = 0
+    errors = 0
+
+    if initial_queue:
+        queue.extend(initial_queue)
+    else:
+        logger.info("Looking up panorama at (%.6f, %.6f)", start_lat, start_lng)
+        try:
+            meta = tiles_client.get_metadata(lat=start_lat, lng=start_lng)
+        except Exception as e:
+            logger.error("No panorama at (%.6f, %.6f): %s", start_lat, start_lng, e)
+            return 0
+        start_pano = meta.get("panoId")
+        if not start_pano:
+            logger.error("No panorama found at starting coordinates")
+            return 0
+        queue.append((start_pano, 0))
+
+    while queue:
+        pano_id, depth = queue.popleft()
+
+        if pano_id in visited:
+            continue
+
+        try:
+            metadata = tiles_client.get_metadata(pano_id=pano_id)
+        except Exception as e:
+            logger.warning("Failed to get metadata for %s: %s", pano_id, e)
+            errors += 1
+            continue
+
+        actual_pano_id = metadata.get("panoId")
+        if not actual_pano_id:
+            errors += 1
+            continue
+
+        if actual_pano_id != pano_id:
+            logger.debug("Redirect: %s -> %s", pano_id, actual_pano_id)
+            if actual_pano_id in visited:
+                continue
+            pano_id = actual_pano_id
+
+        visited.add(pano_id)
+
+        db.insert_panorama(
+            pano_id=pano_id,
+            lat=metadata.get("lat"),
+            lng=metadata.get("lng"),
+            date=metadata.get("date"),
+            metadata_json=json.dumps(metadata),
+            job_id=job_id,
+            bfs_depth=depth,
+        )
+        discovered += 1
+
+        links = metadata.get("links") or []
+        db.insert_links(pano_id, links)
+
+        if depth < max_depth:
+            for link in links:
+                neighbor_id = link.get("panoId")
+                if neighbor_id and neighbor_id not in visited:
+                    queue.append((neighbor_id, depth + 1))
+
+        if discovered % 10 == 0:
+            db.update_job(job_id, panos_discovered=len(visited))
+            logger.info(
+                "Discovery: %d panos (depth %d/%d), queue=%d, errors=%d",
+                discovered, depth, max_depth, len(queue), errors,
+            )
+
+    db.update_job(job_id, panos_discovered=len(visited))
+    return discovered
+
+
+# ---------------------------------------------------------------------------
+# MapCrunch Screenshot Capture (Phase 2)
 # ---------------------------------------------------------------------------
 
 class MapCrunchCapture:
@@ -397,14 +684,17 @@ class MapCrunchCapture:
         if self._playwright:
             await self._playwright.stop()
 
-    async def capture_location(
+    async def capture_pano(
         self,
+        pano_id: str,
         lat: float,
         lng: float,
         angles: List[Tuple[float, float, float]],
         image_root: str,
     ) -> List[Dict[str, Any]]:
-        """Capture screenshots for one location at multiple view angles.
+        """Capture screenshots for one panorama at multiple view angles.
+
+        Images are saved to <image_root>/<pano_id>/<heading>_<pitch>_<zoom>.jpg
 
         *angles* is a list of (heading, pitch, zoom) tuples.
         Returns list of result dicts.
@@ -426,23 +716,19 @@ class MapCrunchCapture:
         results: List[Dict[str, Any]] = []
 
         try:
-            # Load page
             logger.info("Loading %s", url)
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-            # Wait for Google Maps JS API
             try:
                 await page.wait_for_function(
                     "window.google && window.google.maps", timeout=20_000,
                 )
             except Exception:
-                logger.warning("Google Maps API did not load — skipping location")
+                logger.warning("Google Maps API did not load — skipping pano %s", pano_id)
                 return results
 
-            # Let panorama initialise
             await asyncio.sleep(3)
 
-            # --- overlay removal pipeline ---
             await page.add_style_tag(content=OVERLAY_HIDE_CSS)
             cfg = await page.evaluate(FIND_AND_CONFIGURE_PANORAMA_JS)
             await page.evaluate(DOM_CLEANUP_JS)
@@ -458,18 +744,16 @@ class MapCrunchCapture:
                     "Could not find panorama object — using CSS-only overlay removal"
                 )
 
-            # Wait for tiles then settle
             await page.evaluate(WAIT_TILES_JS, 8000)
             await asyncio.sleep(1)
 
-            # Capture all angles — always set POV explicitly
+            # Capture all angles
             for heading, pitch, zoom in angles:
                 changed = await page.evaluate(SET_POV_JS, [heading, pitch, zoom])
                 if changed:
                     await page.evaluate(WAIT_TILES_JS, 5000)
                     await asyncio.sleep(0.5)
                 else:
-                    # Fallback: full page reload with new URL
                     url2 = f"{MAPCRUNCH_BASE}/p/{lat}_{lng}_{heading}_{pitch}_{zoom}"
                     await page.goto(
                         url2, wait_until="domcontentloaded", timeout=30_000,
@@ -490,13 +774,13 @@ class MapCrunchCapture:
                     await asyncio.sleep(1)
 
                 r = await self._take_screenshot(
-                    page, lat, lng, heading, pitch, zoom, image_root, cfg,
+                    page, pano_id, heading, pitch, zoom, image_root,
                 )
                 if r:
                     results.append(r)
 
         except Exception as e:
-            logger.error("Capture failed for (%.6f, %.6f): %s", lat, lng, e)
+            logger.error("Capture failed for pano %s: %s", pano_id, e)
         finally:
             await context.close()
 
@@ -505,25 +789,17 @@ class MapCrunchCapture:
     async def _take_screenshot(
         self,
         page: Any,
-        lat: float,
-        lng: float,
+        pano_id: str,
         heading: float,
         pitch: float,
         zoom: float,
         image_root: str,
-        cfg: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        state = await page.evaluate(GET_STATE_JS)
-        pano_id = None
-        if state:
-            pano_id = state.get("panoId")
-        if not pano_id:
-            pano_id = cfg.get("panoId")
-
-        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", pano_id or f"{lat}_{lng}")
-        subdir = os.path.join(image_root, safe_id[:12])
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", pano_id)
+        subdir = os.path.join(image_root, safe_id)
         os.makedirs(subdir, exist_ok=True)
-        filename = f"{safe_id}_h{heading:.1f}_p{pitch:.1f}_z{zoom:.1f}.jpg"
+
+        filename = f"{heading:.1f}_{pitch:.1f}_{zoom:.1f}.jpg"
         filepath = os.path.join(subdir, filename)
 
         try:
@@ -540,7 +816,6 @@ class MapCrunchCapture:
                 "image_path": rel_path,
                 "width": self._vw,
                 "height": self._vh,
-                "metadata": state,
             }
         except Exception as e:
             logger.error("Screenshot failed: %s", e)
@@ -554,24 +829,35 @@ class MapCrunchCapture:
 @dataclass
 class CaptureConfig:
     starting_points: List[Tuple[float, float]] = field(default_factory=list)
+    max_depth: int = 50
     headings: List[float] = field(default_factory=lambda: [float(i) for i in range(0, 360, 10)])
     pitches: List[float] = field(default_factory=lambda: [float(i) for i in range(-40, 50, 10)])
     zooms: List[float] = field(default_factory=lambda: [0.0, 1.0, 1.5, 2.0, 3.0])
-    db_path: str = "mapcrunch_captures.db"
+    db_path: str = "mapcrunch.db"
     image_root: str = "mapcrunch_images"
     viewport_width: int = 1920
     viewport_height: int = 1080
     headless: bool = True
     quality: int = 95
     skip_existing: bool = True
+    resume: bool = False
+    api_key: Optional[str] = None
 
 
 class MapCrunchOrchestrator:
-    """Top-level coordinator for batch MapCrunch screenshot capture."""
+    """Two-phase pipeline: BFS discovery then MapCrunch screenshot capture."""
 
     def __init__(self, config: CaptureConfig) -> None:
         self.config = config
         self.db = CaptureDatabase(config.db_path)
+
+        api_key = config.api_key or os.getenv("GOOGLE_MAPS_API_KEY", "")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_MAPS_API_KEY not provided and not set in environment"
+            )
+        self.tiles_client = TilesAPIClient(api_key)
+
         self.capture = MapCrunchCapture(
             headless=config.headless,
             viewport_width=config.viewport_width,
@@ -581,80 +867,193 @@ class MapCrunchOrchestrator:
 
     async def run(self) -> None:
         os.makedirs(self.config.image_root, exist_ok=True)
-        await self.capture.start()
-
-        total_captures = 0
-        total_skipped = 0
-        total_errors = 0
         t_start = time.time()
 
+        total_discovered = 0
+        total_captured = 0
+        total_skipped = 0
+        total_errors = 0
+
         try:
+            # --- Resume interrupted jobs ---
+            if self.config.resume:
+                for job in self.db.get_running_jobs():
+                    job_id = job["job_id"]
+                    lat, lng = job["start_lat"], job["start_lng"]
+                    max_depth = job["max_depth"]
+                    logger.info("Resuming job %d at (%.6f, %.6f)", job_id, lat, lng)
+
+                    # Continue BFS if there are unvisited neighbors
+                    visited = self.db.get_visited_pano_ids(job_id)
+                    frontier = [
+                        (pid, d) for pid, d in self.db.get_unvisited_neighbors(job_id)
+                        if d <= max_depth
+                    ]
+                    if frontier:
+                        n = bfs_discover(
+                            self.tiles_client, self.db,
+                            lat, lng, job_id, max_depth,
+                            visited=visited, initial_queue=frontier,
+                        )
+                        total_discovered += n
+
+                    # Capture pending panos
+                    captured, skipped, errors = await self._capture_job(job_id)
+                    total_captured += captured
+                    total_skipped += skipped
+                    total_errors += errors
+
+                    self.db.update_job(
+                        job_id, status="completed",
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                        panos_captured=self.db.count_panos(job_id) - len(self.db.get_pending_panos(job_id)),
+                    )
+
+            # --- Process each starting point ---
             for i, (lat, lng) in enumerate(self.config.starting_points, 1):
                 logger.info(
-                    "Location %d/%d: (%.6f, %.6f)",
+                    "=== Starting point %d/%d: (%.6f, %.6f) ===",
                     i, len(self.config.starting_points), lat, lng,
                 )
 
-                # Build angle combinations, skipping already-captured
-                angles: List[Tuple[float, float, float]] = []
-                for h in self.config.headings:
-                    for p in self.config.pitches:
-                        for z in self.config.zooms:
-                            if self.config.skip_existing and self.db.has_capture(
-                                lat, lng, h, p, z,
-                            ):
-                                total_skipped += 1
-                                continue
-                            angles.append((h, p, z))
+                # Check for existing job
+                existing = self.db.find_existing_job(lat, lng)
+                if existing and existing["status"] == "completed":
+                    # Re-use existing BFS, just capture any pending panos
+                    job_id = existing["job_id"]
+                    pending = self.db.get_pending_panos(job_id)
+                    if not pending:
+                        logger.info("Job %d already complete — skipping", job_id)
+                        continue
+                    logger.info(
+                        "Job %d has %d pending panos — capturing", job_id, len(pending),
+                    )
+                else:
+                    job_id = self.db.create_job(lat, lng, self.config.max_depth)
 
-                if not angles:
-                    logger.info("  All angles already captured — skipping")
-                    continue
+                    # Phase 1: BFS Discovery
+                    logger.info("Phase 1: BFS discovery (max_depth=%d)", self.config.max_depth)
+                    self.db.update_job(job_id, status="discovering")
+                    t0 = time.time()
+                    n = bfs_discover(
+                        self.tiles_client, self.db,
+                        lat, lng, job_id, self.config.max_depth,
+                    )
+                    total_discovered += n
+                    logger.info(
+                        "Discovery complete: %d panoramas in %.1fs",
+                        n, time.time() - t0,
+                    )
 
-                logger.info("  Capturing %d angle combinations", len(angles))
-                results = await self.capture.capture_location(
-                    lat, lng, angles, self.config.image_root,
+                # Phase 2: MapCrunch Capture
+                logger.info("Phase 2: MapCrunch screenshot capture")
+                self.db.update_job(job_id, status="capturing")
+                captured, skipped, errors = await self._capture_job(job_id)
+                total_captured += captured
+                total_skipped += skipped
+                total_errors += errors
+
+                self.db.update_job(
+                    job_id, status="completed",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    panos_captured=captured,
                 )
 
-                for r in results:
-                    self.db.insert_capture(
-                        pano_id=r["pano_id"],
-                        lat=lat,
-                        lng=lng,
-                        heading=r["heading"],
-                        pitch=r["pitch"],
-                        zoom=r["zoom"],
-                        image_path=r["image_path"],
-                        width=r["width"],
-                        height=r["height"],
-                        metadata_json=(
-                            json.dumps(r["metadata"]) if r.get("metadata") else None
-                        ),
-                    )
-                    total_captures += 1
-
-                missed = len(angles) - len(results)
-                if missed > 0:
-                    total_errors += missed
-
         except KeyboardInterrupt:
-            logger.info("Interrupted — progress saved in %s", self.config.db_path)
+            logger.info("Interrupted — progress saved in %s. Use --resume to continue.", self.config.db_path)
         except Exception as e:
             logger.exception("Orchestrator failed: %s", e)
         finally:
             dur = time.time() - t_start
             mins, secs = divmod(dur, 60)
-            logger.info("=== CAPTURE SUMMARY ===")
-            logger.info("  Locations        : %d", len(self.config.starting_points))
-            logger.info("  Screenshots taken: %d", total_captures)
+            logger.info("=== SUMMARY ===")
+            logger.info("  Panos discovered : %d", total_discovered)
+            logger.info("  Screenshots taken: %d", total_captured)
             logger.info("  Skipped (exist)  : %d", total_skipped)
             logger.info("  Errors           : %d", total_errors)
             logger.info("  Total time       : %dm %.1fs", int(mins), secs)
-            if total_captures > 0:
-                logger.info("  Avg time/capture : %.1fs", dur / total_captures)
 
             await self.capture.close()
+            self.tiles_client.close()
             self.db.close()
+
+    async def _capture_job(self, job_id: int) -> Tuple[int, int, int]:
+        """Capture all pending panoramas for a job.
+
+        Returns (captured, skipped, errors).
+        """
+        pending = self.db.get_pending_panos(job_id)
+        if not pending:
+            return 0, 0, 0
+
+        # Lazily start browser only when we need it
+        if not self.capture._browser:
+            await self.capture.start()
+
+        captured = 0
+        skipped = 0
+        errors = 0
+        total = len(pending)
+
+        for idx, pano in enumerate(pending, 1):
+            pano_id = pano["pano_id"]
+            lat = pano["lat"]
+            lng = pano["lng"]
+
+            if lat is None or lng is None:
+                logger.warning("Pano %s has no coordinates — skipping", pano_id)
+                self.db.mark_pano_failed(pano_id)
+                errors += 1
+                continue
+
+            # Build angle list, skipping already-captured
+            angles: List[Tuple[float, float, float]] = []
+            for h in self.config.headings:
+                for p in self.config.pitches:
+                    for z in self.config.zooms:
+                        if self.config.skip_existing and self.db.has_capture(
+                            pano_id, h, p, z,
+                        ):
+                            skipped += 1
+                            continue
+                        angles.append((h, p, z))
+
+            if not angles:
+                logger.info(
+                    "[%d/%d] Pano %s: all angles already captured", idx, total, pano_id,
+                )
+                self.db.mark_pano_captured(pano_id)
+                continue
+
+            logger.info(
+                "[%d/%d] Pano %s: capturing %d angles", idx, total, pano_id, len(angles),
+            )
+            results = await self.capture.capture_pano(
+                pano_id, lat, lng, angles, self.config.image_root,
+            )
+
+            for r in results:
+                self.db.insert_capture(
+                    pano_id=r["pano_id"],
+                    heading=r["heading"],
+                    pitch=r["pitch"],
+                    zoom=r["zoom"],
+                    image_path=r["image_path"],
+                    width=r["width"],
+                    height=r["height"],
+                )
+                captured += 1
+
+            missed = len(angles) - len(results)
+            if missed > 0:
+                errors += missed
+
+            if len(results) > 0:
+                self.db.mark_pano_captured(pano_id)
+            else:
+                self.db.mark_pano_failed(pano_id)
+
+        return captured, skipped, errors
 
 
 # ---------------------------------------------------------------------------
@@ -695,10 +1094,10 @@ def _load_coords_file(path: str) -> List[Tuple[float, float]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Capture clean Street View screenshots via MapCrunch",
+        description="BFS discovery + MapCrunch Street View screenshot capture",
     )
 
-    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         "--coords", nargs="+", metavar="LAT,LNG",
         help="Starting coordinates as lat,lng pairs",
@@ -709,20 +1108,24 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--max-depth", type=int, default=50,
+        help="Max BFS depth from each starting point (default: 50)",
+    )
+    parser.add_argument(
         "--headings", nargs="+", type=float, default=[float(i) for i in range(0, 360, 10)],
-        help="Heading angles in degrees (default: every 10° from 0-350)",
+        help="Heading angles in degrees (default: every 10 deg from 0-350)",
     )
     parser.add_argument(
         "--pitches", nargs="+", type=float, default=[float(i) for i in range(-40, 50, 10)],
-        help="Pitch angles in degrees (default: every 10° from -40 to +40)",
+        help="Pitch angles in degrees (default: every 10 deg from -40 to +40)",
     )
     parser.add_argument(
         "--zooms", nargs="+", type=float, default=[0.0, 1.0, 1.5, 2.0, 3.0],
         help="Zoom levels (default: 0 1 1.5 2 3)",
     )
     parser.add_argument(
-        "--db", type=str, default="mapcrunch_captures.db",
-        help="SQLite database path (default: mapcrunch_captures.db)",
+        "--db", type=str, default="mapcrunch.db",
+        help="SQLite database path (default: mapcrunch.db)",
     )
     parser.add_argument(
         "--image-dir", type=str, default="mapcrunch_images",
@@ -744,6 +1147,10 @@ def main() -> None:
         "--no-skip-existing", action="store_true",
         help="Re-capture even if screenshot already exists in DB",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume interrupted jobs from the database",
+    )
 
     args = parser.parse_args()
 
@@ -752,6 +1159,9 @@ def main() -> None:
         starting_points = [_parse_coord(c) for c in args.coords]
     elif args.coords_file:
         starting_points = _load_coords_file(args.coords_file)
+
+    if not starting_points and not args.resume:
+        parser.error("Either --coords, --coords-file, or --resume is required")
 
     try:
         vw_s, vh_s = args.viewport.lower().split("x")
@@ -763,6 +1173,7 @@ def main() -> None:
 
     config = CaptureConfig(
         starting_points=starting_points,
+        max_depth=args.max_depth,
         headings=args.headings,
         pitches=args.pitches,
         zooms=args.zooms,
@@ -773,6 +1184,7 @@ def main() -> None:
         headless=not args.no_headless,
         quality=args.quality,
         skip_existing=not args.no_skip_existing,
+        resume=args.resume,
     )
 
     orchestrator = MapCrunchOrchestrator(config)
