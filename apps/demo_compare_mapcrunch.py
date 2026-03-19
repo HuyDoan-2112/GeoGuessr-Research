@@ -356,8 +356,8 @@ def main() -> None:
         help="Comma-separated pitch values (default: -40,-20,0,20,40)",
     )
     parser.add_argument(
-        "--zooms", type=str, default="0.5,1.0,1.5,2.0,3.0",
-        help="Comma-separated zoom levels (default: 0.5,1.0,1.5,2.0,3.0)",
+        "--zooms", type=str, default="0.0,1.0,1.5,2.0,3.0",
+        help="Comma-separated zoom levels (default: 0.0,1.0,1.5,2.0,3.0)",
     )
     parser.add_argument("--size", type=str, default="640x640",
                         help="Static API image size (default: 640x640)")
