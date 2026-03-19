@@ -550,6 +550,50 @@ class CaptureDatabase:
 # BFS Discovery (Phase 1)
 # ---------------------------------------------------------------------------
 
+def _is_user_pano(metadata: Dict[str, Any]) -> bool:
+    """Return True if the panorama appears to be user-contributed (not official Google)."""
+    copyright_str = metadata.get("copyright", "")
+    return "Google" not in copyright_str
+
+
+def _find_official_pano(
+    tiles_client: TilesAPIClient,
+    lat: float,
+    lng: float,
+    api_key: str,
+) -> Optional[Dict[str, Any]]:
+    """Try to find an official Google Street View pano at the given coordinates.
+
+    Uses the Street View Static Metadata API with source=outdoor, then looks
+    up the full metadata via the Tiles API if found.
+    """
+    import requests as _requests
+
+    try:
+        resp = _requests.get(
+            "https://maps.googleapis.com/maps/api/streetview/metadata",
+            params={
+                "key": api_key,
+                "location": f"{lat},{lng}",
+                "source": "outdoor",
+                "radius": 50,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "OK":
+            return None
+        official_pano_id = data.get("pano_id")
+        if not official_pano_id:
+            return None
+        # Fetch full metadata via Tiles API
+        return tiles_client.get_metadata(pano_id=official_pano_id)
+    except Exception as e:
+        logger.debug("Official pano lookup failed at (%.6f, %.6f): %s", lat, lng, e)
+        return None
+
+
 def bfs_discover(
     tiles_client: TilesAPIClient,
     db: CaptureDatabase,
@@ -559,6 +603,7 @@ def bfs_discover(
     max_depth: int,
     visited: Optional[Set[str]] = None,
     initial_queue: Optional[List[Tuple[str, int]]] = None,
+    api_key: Optional[str] = None,
 ) -> int:
     """BFS traverse the Street View graph, storing metadata + links.
 
@@ -609,6 +654,23 @@ def bfs_discover(
             if actual_pano_id in visited:
                 continue
             pano_id = actual_pano_id
+
+        # If this is a user-contributed pano, try to find the official one
+        # at the same coordinates (official panos have neighbor links).
+        if _is_user_pano(metadata) and api_key:
+            lat = metadata.get("lat")
+            lng = metadata.get("lng")
+            if lat is not None and lng is not None:
+                official = _find_official_pano(tiles_client, lat, lng, api_key)
+                if official and official.get("panoId"):
+                    official_id = official["panoId"]
+                    if official_id not in visited:
+                        logger.info(
+                            "Replacing user pano %s with official %s",
+                            pano_id, official_id,
+                        )
+                        metadata = official
+                        pano_id = official_id
 
         visited.add(pano_id)
 
@@ -751,8 +813,8 @@ class MapCrunchCapture:
             for heading, pitch, zoom in angles:
                 changed = await page.evaluate(SET_POV_JS, [heading, pitch, zoom])
                 if changed:
-                    await page.evaluate(WAIT_TILES_JS, 5000)
-                    await asyncio.sleep(0.5)
+                    await page.evaluate(WAIT_TILES_JS, 1500)
+                    await asyncio.sleep(0.3)
                 else:
                     url2 = f"{MAPCRUNCH_BASE}/p/{lat}_{lng}_{heading}_{pitch}_{zoom}"
                     await page.goto(
@@ -894,6 +956,7 @@ class MapCrunchOrchestrator:
                             self.tiles_client, self.db,
                             lat, lng, job_id, max_depth,
                             visited=visited, initial_queue=frontier,
+                            api_key=self.config.api_key or os.getenv("GOOGLE_MAPS_API_KEY", ""),
                         )
                         total_discovered += n
 
@@ -938,6 +1001,7 @@ class MapCrunchOrchestrator:
                     n = bfs_discover(
                         self.tiles_client, self.db,
                         lat, lng, job_id, self.config.max_depth,
+                        api_key=self.config.api_key or os.getenv("GOOGLE_MAPS_API_KEY", ""),
                     )
                     total_discovered += n
                     logger.info(
