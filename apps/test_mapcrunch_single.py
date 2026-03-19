@@ -268,6 +268,7 @@ def create_mosaic(db: CaptureDatabase, job_id: int) -> str:
 
 
 async def main() -> None:
+    import time as _time
     from dotenv import load_dotenv
 
     load_dotenv(ROOT / ".env")
@@ -277,22 +278,49 @@ async def main() -> None:
         print("ERROR: Set GOOGLE_MAPS_API_KEY in .env or environment")
         sys.exit(1)
 
+    t_total = _time.time()
+    timings: list[tuple[str, float]] = []
+
     # Phase 1: BFS discovery (depth=1 to get neighbor links)
     print("Phase 1: BFS Discovery...")
+    t0 = _time.time()
     job_id, db = run_bfs(api_key)
+    dt = _time.time() - t0
+    timings.append(("BFS Discovery", dt))
+    print(f"  -> {dt:.1f}s")
 
     # Show neighbor info
     print_neighbor_info(db, job_id)
 
     # Phase 2: Capture screenshots for starting pano only
     print("Phase 2: Capturing screenshots for starting pano...")
+    t0 = _time.time()
     await capture_start_pano(db, job_id)
+    dt = _time.time() - t0
+    timings.append(("Screenshot Capture", dt))
+    print(f"  -> {dt:.1f}s")
 
     # Phase 3: Create mosaic
     print("Phase 3: Creating labeled mosaic...")
+    t0 = _time.time()
     mosaic_path = create_mosaic(db, job_id)
+    dt = _time.time() - t0
+    timings.append(("Mosaic Creation", dt))
+    print(f"  -> {dt:.1f}s")
+
     if mosaic_path:
         print(f"\nMosaic saved to: {mosaic_path}")
+
+    # Timing summary
+    total = _time.time() - t_total
+    print(f"\n{'='*40}")
+    print("Timing Summary")
+    print(f"{'='*40}")
+    for name, dt in timings:
+        print(f"  {name:<25} {dt:6.1f}s")
+    print(f"  {'─'*32}")
+    print(f"  {'Total':<25} {total:6.1f}s")
+    print(f"{'='*40}")
 
     db.close()
 
