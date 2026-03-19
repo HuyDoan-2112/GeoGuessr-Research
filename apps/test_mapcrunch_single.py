@@ -29,7 +29,8 @@ from apps.mapcrunch_crawler import (
 
 logger = logging.getLogger(__name__)
 
-LAT, LNG = 40.7580, -73.9855
+# Official Google Street View pano at Times Square (avoids user photospheres)
+LAT, LNG = 40.75798548022977, -73.98552675217574
 DB_PATH = "test_mapcrunch_single.db"
 IMAGE_ROOT = "test_mapcrunch_single_images"
 
