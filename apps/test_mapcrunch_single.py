@@ -60,6 +60,11 @@ def run_bfs(api_key: str) -> Tuple[int, CaptureDatabase, int]:
 
     Returns (job_id, db, api_call_count).
     """
+    # Clean up any previous test run
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+        logger.info("Removed stale database %s", DB_PATH)
+
     db = CaptureDatabase(DB_PATH)
     tiles = CountingTilesClient(api_key)
 
