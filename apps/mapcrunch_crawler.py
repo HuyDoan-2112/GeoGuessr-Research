@@ -554,8 +554,8 @@ class MapCrunchCapture:
 @dataclass
 class CaptureConfig:
     starting_points: List[Tuple[float, float]] = field(default_factory=list)
-    headings: List[float] = field(default_factory=lambda: [0.0])
-    pitches: List[float] = field(default_factory=lambda: [0.0])
+    headings: List[float] = field(default_factory=lambda: [float(i) for i in range(0, 360, 10)])
+    pitches: List[float] = field(default_factory=lambda: [float(i) for i in range(-40, 50, 10)])
     zooms: List[float] = field(default_factory=lambda: [0.0, 1.0, 1.5, 2.0, 3.0])
     db_path: str = "mapcrunch_captures.db"
     image_root: str = "mapcrunch_images"
@@ -709,12 +709,12 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--headings", nargs="+", type=float, default=[0.0],
-        help="Heading angles in degrees (default: 0)",
+        "--headings", nargs="+", type=float, default=[float(i) for i in range(0, 360, 10)],
+        help="Heading angles in degrees (default: every 10° from 0-350)",
     )
     parser.add_argument(
-        "--pitches", nargs="+", type=float, default=[0.0],
-        help="Pitch angles in degrees (default: 0)",
+        "--pitches", nargs="+", type=float, default=[float(i) for i in range(-40, 50, 10)],
+        help="Pitch angles in degrees (default: every 10° from -40 to +40)",
     )
     parser.add_argument(
         "--zooms", nargs="+", type=float, default=[0.0, 1.0, 1.5, 2.0, 3.0],
