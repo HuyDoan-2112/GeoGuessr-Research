@@ -671,6 +671,16 @@ def bfs_discover(
                         )
                         metadata = official
                         pano_id = official_id
+                        # Alert when a starting-point pano was replaced so the
+                        # source CSV can be updated with the official coords.
+                        if depth == 0:
+                            new_lat = metadata.get("lat")
+                            new_lng = metadata.get("lng")
+                            print(
+                                f"COORD_UPDATE: starting point ({start_lat},{start_lng}) "
+                                f"was a user pano -> official pano {pano_id} "
+                                f"at ({new_lat},{new_lng})"
+                            )
 
         visited.add(pano_id)
 
