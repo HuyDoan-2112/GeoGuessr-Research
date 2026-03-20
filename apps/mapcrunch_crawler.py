@@ -914,6 +914,7 @@ class CaptureConfig:
     skip_existing: bool = True
     resume: bool = False
     api_key: Optional[str] = None
+    concurrency: int = 4
 
 
 class MapCrunchOrchestrator:
@@ -945,8 +946,15 @@ class MapCrunchOrchestrator:
         total_captured = 0
         total_skipped = 0
         total_errors = 0
+        job_ids: List[int] = []
 
         try:
+            # ============================================================
+            # Phase 1: BFS Discovery for ALL starting points
+            # ============================================================
+            logger.info("=== Phase 1: BFS Discovery ===")
+            t0 = time.time()
+
             # --- Resume interrupted jobs ---
             if self.config.resume:
                 for job in self.db.get_running_jobs():
@@ -955,7 +963,6 @@ class MapCrunchOrchestrator:
                     max_depth = job["max_depth"]
                     logger.info("Resuming job %d at (%.6f, %.6f)", job_id, lat, lng)
 
-                    # Continue BFS if there are unvisited neighbors
                     visited = self.db.get_visited_pano_ids(job_id)
                     frontier = [
                         (pid, d) for pid, d in self.db.get_unvisited_neighbors(job_id)
@@ -969,68 +976,72 @@ class MapCrunchOrchestrator:
                             api_key=self.config.api_key or os.getenv("GOOGLE_MAPS_API_KEY", ""),
                         )
                         total_discovered += n
+                    job_ids.append(job_id)
 
-                    # Capture pending panos
-                    captured, skipped, errors = await self._capture_job(job_id)
-                    total_captured += captured
-                    total_skipped += skipped
-                    total_errors += errors
-
-                    self.db.update_job(
-                        job_id, status="completed",
-                        completed_at=datetime.now(timezone.utc).isoformat(),
-                        panos_captured=self.db.count_panos(job_id) - len(self.db.get_pending_panos(job_id)),
-                    )
-
-            # --- Process each starting point ---
+            # --- Discover each starting point ---
             for i, (lat, lng) in enumerate(self.config.starting_points, 1):
                 logger.info(
-                    "=== Starting point %d/%d: (%.6f, %.6f) ===",
+                    "BFS %d/%d: (%.6f, %.6f)",
                     i, len(self.config.starting_points), lat, lng,
                 )
 
-                # Check for existing job
                 existing = self.db.find_existing_job(lat, lng)
                 if existing and existing["status"] == "completed":
-                    # Re-use existing BFS, just capture any pending panos
                     job_id = existing["job_id"]
                     pending = self.db.get_pending_panos(job_id)
                     if not pending:
                         logger.info("Job %d already complete — skipping", job_id)
                         continue
-                    logger.info(
-                        "Job %d has %d pending panos — capturing", job_id, len(pending),
-                    )
+                    logger.info("Job %d has %d pending panos", job_id, len(pending))
                 else:
                     job_id = self.db.create_job(lat, lng, self.config.max_depth)
-
-                    # Phase 1: BFS Discovery
-                    logger.info("Phase 1: BFS discovery (max_depth=%d)", self.config.max_depth)
                     self.db.update_job(job_id, status="discovering")
-                    t0 = time.time()
                     n = bfs_discover(
                         self.tiles_client, self.db,
                         lat, lng, job_id, self.config.max_depth,
                         api_key=self.config.api_key or os.getenv("GOOGLE_MAPS_API_KEY", ""),
                     )
                     total_discovered += n
-                    logger.info(
-                        "Discovery complete: %d panoramas in %.1fs",
-                        n, time.time() - t0,
-                    )
+                    logger.info("Discovered %d panoramas for job %d", n, job_id)
 
-                # Phase 2: MapCrunch Capture
-                logger.info("Phase 2: MapCrunch screenshot capture")
+                job_ids.append(job_id)
+
+            logger.info(
+                "Phase 1 complete: %d panos across %d jobs in %.1fs",
+                total_discovered, len(job_ids), time.time() - t0,
+            )
+
+            # ============================================================
+            # Phase 2: Parallel screenshot capture across ALL jobs
+            # ============================================================
+            logger.info(
+                "=== Phase 2: Parallel capture (concurrency=%d) ===",
+                self.config.concurrency,
+            )
+
+            # Collect all pending panos across all jobs
+            all_pending: List[Tuple[int, Dict[str, Any]]] = []
+            for job_id in job_ids:
                 self.db.update_job(job_id, status="capturing")
-                captured, skipped, errors = await self._capture_job(job_id)
+                for pano in self.db.get_pending_panos(job_id):
+                    all_pending.append((job_id, pano))
+
+            if not all_pending:
+                logger.info("No pending panoramas to capture")
+            else:
+                logger.info("Capturing %d panoramas", len(all_pending))
+                captured, skipped, errors = await self._capture_parallel(all_pending)
                 total_captured += captured
                 total_skipped += skipped
                 total_errors += errors
 
+            # Mark all jobs completed
+            now = datetime.now(timezone.utc).isoformat()
+            for job_id in job_ids:
+                done_count = self.db.count_panos(job_id) - len(self.db.get_pending_panos(job_id))
                 self.db.update_job(
                     job_id, status="completed",
-                    completed_at=datetime.now(timezone.utc).isoformat(),
-                    panos_captured=captured,
+                    completed_at=now, panos_captured=done_count,
                 )
 
         except KeyboardInterrupt:
@@ -1051,25 +1062,23 @@ class MapCrunchOrchestrator:
             self.tiles_client.close()
             self.db.close()
 
-    async def _capture_job(self, job_id: int) -> Tuple[int, int, int]:
-        """Capture all pending panoramas for a job.
+    async def _capture_parallel(
+        self, all_pending: List[Tuple[int, Dict[str, Any]]],
+    ) -> Tuple[int, int, int]:
+        """Capture all pending panoramas in parallel.
 
         Returns (captured, skipped, errors).
         """
-        pending = self.db.get_pending_panos(job_id)
-        if not pending:
-            return 0, 0, 0
-
-        # Lazily start browser only when we need it
         if not self.capture._browser:
             await self.capture.start()
 
-        captured = 0
-        skipped = 0
-        errors = 0
-        total = len(pending)
+        sem = asyncio.Semaphore(self.config.concurrency)
+        total = len(all_pending)
 
-        for idx, pano in enumerate(pending, 1):
+        # Shared counters (safe because asyncio is single-threaded)
+        counters = {"captured": 0, "skipped": 0, "errors": 0, "done": 0}
+
+        async def _process_one(idx: int, job_id: int, pano: Dict[str, Any]) -> None:
             pano_id = pano["pano_id"]
             lat = pano["lat"]
             lng = pano["lng"]
@@ -1077,8 +1086,9 @@ class MapCrunchOrchestrator:
             if lat is None or lng is None:
                 logger.warning("Pano %s has no coordinates — skipping", pano_id)
                 self.db.mark_pano_failed(pano_id)
-                errors += 1
-                continue
+                counters["errors"] += 1
+                counters["done"] += 1
+                return
 
             # Build angle list, skipping already-captured
             angles: List[Tuple[float, float, float]] = []
@@ -1088,23 +1098,28 @@ class MapCrunchOrchestrator:
                         if self.config.skip_existing and self.db.has_capture(
                             pano_id, h, p, z,
                         ):
-                            skipped += 1
+                            counters["skipped"] += 1
                             continue
                         angles.append((h, p, z))
 
             if not angles:
                 logger.info(
-                    "[%d/%d] Pano %s: all angles already captured", idx, total, pano_id,
+                    "[%d/%d] Pano %s: all angles already captured",
+                    idx, total, pano_id,
                 )
                 self.db.mark_pano_captured(pano_id)
-                continue
+                counters["done"] += 1
+                return
 
             logger.info(
-                "[%d/%d] Pano %s: capturing %d angles", idx, total, pano_id, len(angles),
+                "[%d/%d] Pano %s: capturing %d angles",
+                idx, total, pano_id, len(angles),
             )
-            results = await self.capture.capture_pano(
-                pano_id, lat, lng, angles, self.config.image_root,
-            )
+
+            async with sem:
+                results = await self.capture.capture_pano(
+                    pano_id, lat, lng, angles, self.config.image_root,
+                )
 
             for r in results:
                 self.db.insert_capture(
@@ -1116,18 +1131,31 @@ class MapCrunchOrchestrator:
                     width=r["width"],
                     height=r["height"],
                 )
-                captured += 1
+                counters["captured"] += 1
 
             missed = len(angles) - len(results)
             if missed > 0:
-                errors += missed
+                counters["errors"] += missed
 
             if len(results) > 0:
                 self.db.mark_pano_captured(pano_id)
             else:
                 self.db.mark_pano_failed(pano_id)
 
-        return captured, skipped, errors
+            counters["done"] += 1
+            if counters["done"] % 10 == 0:
+                logger.info(
+                    "Progress: %d/%d panos done, %d screenshots taken",
+                    counters["done"], total, counters["captured"],
+                )
+
+        tasks = [
+            _process_one(idx, job_id, pano)
+            for idx, (job_id, pano) in enumerate(all_pending, 1)
+        ]
+        await asyncio.gather(*tasks)
+
+        return counters["captured"], counters["skipped"], counters["errors"]
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1254,10 @@ def main() -> None:
         "--resume", action="store_true",
         help="Resume interrupted jobs from the database",
     )
+    parser.add_argument(
+        "--concurrency", type=int, default=4,
+        help="Number of panoramas to capture in parallel (default: 4)",
+    )
 
     args = parser.parse_args()
 
@@ -1260,6 +1292,7 @@ def main() -> None:
         quality=args.quality,
         skip_existing=not args.no_skip_existing,
         resume=args.resume,
+        concurrency=args.concurrency,
     )
 
     orchestrator = MapCrunchOrchestrator(config)
