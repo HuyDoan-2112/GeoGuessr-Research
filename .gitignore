@@ -25,7 +25,7 @@ test-results/
 Thumbs.db
 
 # Logs
-*.log
+# *.log
 
 # Images
 images/
@@ -37,3 +37,4 @@ images/
 *events.jsonl
 */test_multi_agents_hard_code
 
+mapcrunch_images/*
