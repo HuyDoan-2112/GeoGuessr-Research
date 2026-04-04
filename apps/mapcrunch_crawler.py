@@ -746,9 +746,29 @@ class MapCrunchCapture:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--no-first-run",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
             ],
         )
         logger.info("Browser launched (headless=%s)", self._headless)
+
+    async def restart(self) -> None:
+        """Close and re-launch the browser (used after GPU / crash recovery)."""
+        logger.warning("Restarting browser...")
+        try:
+            if self._browser:
+                await self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception:
+            pass
+        self._browser = None
+        self._playwright = None
+        await self.start()
+        logger.info("Browser restarted successfully")
 
     async def close(self) -> None:
         if self._browser:
@@ -788,18 +808,19 @@ class MapCrunchCapture:
         results: List[Dict[str, Any]] = []
 
         try:
+            # Navigate with retry for connection errors
             logger.info("Loading %s", url)
-            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            await self._goto_with_retry(page, url)
 
             try:
                 await page.wait_for_function(
                     "window.google && window.google.maps", timeout=20_000,
                 )
             except Exception:
-                logger.warning("Google Maps API did not load — skipping pano %s", pano_id)
+                logger.warning("Google Maps API did not load — skipping pano %s at (%.6f, %.6f)", pano_id, lat, lng)
                 return results
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(1.5)
 
             await page.add_style_tag(content=OVERLAY_HIDE_CSS)
             cfg = await page.evaluate(FIND_AND_CONFIGURE_PANORAMA_JS)
@@ -813,11 +834,12 @@ class MapCrunchCapture:
                 )
             else:
                 logger.warning(
-                    "Could not find panorama object — using CSS-only overlay removal"
+                    "Could not find panorama object for pano %s at (%.6f, %.6f) — using CSS-only overlay removal",
+                    pano_id, lat, lng,
                 )
 
             await page.evaluate(WAIT_TILES_JS, 8000)
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
             # Capture all angles
             for heading, pitch, zoom in angles:
@@ -827,9 +849,7 @@ class MapCrunchCapture:
                     await asyncio.sleep(0.3)
                 else:
                     url2 = f"{MAPCRUNCH_BASE}/p/{lat}_{lng}_{heading}_{pitch}_{zoom}"
-                    await page.goto(
-                        url2, wait_until="domcontentloaded", timeout=30_000,
-                    )
+                    await self._goto_with_retry(page, url2)
                     try:
                         await page.wait_for_function(
                             "window.google && window.google.maps", timeout=20_000,
@@ -837,13 +857,13 @@ class MapCrunchCapture:
                     except Exception:
                         logger.warning("Reload failed for angle h=%.1f", heading)
                         continue
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(1.5)
                     await page.add_style_tag(content=OVERLAY_HIDE_CSS)
                     cfg = await page.evaluate(FIND_AND_CONFIGURE_PANORAMA_JS)
                     await page.evaluate(DOM_CLEANUP_JS)
                     await page.evaluate(RESIZE_PANORAMA_JS)
                     await page.evaluate(WAIT_TILES_JS, 8000)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
 
                 r = await self._take_screenshot(
                     page, pano_id, heading, pitch, zoom, image_root,
@@ -852,11 +872,36 @@ class MapCrunchCapture:
                     results.append(r)
 
         except Exception as e:
-            logger.error("Capture failed for pano %s: %s", pano_id, e)
+            logger.error("Capture failed for pano %s at (%.6f, %.6f): %s", pano_id, lat, lng, e)
         finally:
             await context.close()
 
         return results
+
+    @staticmethod
+    async def _goto_with_retry(
+        page: Any, url: str, max_retries: int = 3, base_delay: float = 5.0,
+    ) -> None:
+        """Navigate to URL with exponential backoff on connection errors."""
+        for attempt in range(max_retries):
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                return
+            except Exception as e:
+                err_str = str(e)
+                is_connection_error = (
+                    "ERR_CONNECTION_REFUSED" in err_str
+                    or "ERR_CONNECTION_RESET" in err_str
+                    or "ERR_CONNECTION_TIMED_OUT" in err_str
+                )
+                if not is_connection_error or attempt == max_retries - 1:
+                    raise
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "Connection error (attempt %d/%d), retrying in %.0fs: %s",
+                    attempt + 1, max_retries, delay, err_str[:120],
+                )
+                await asyncio.sleep(delay)
 
     async def _take_screenshot(
         self,
@@ -902,9 +947,9 @@ class MapCrunchCapture:
 class CaptureConfig:
     starting_points: List[Tuple[float, float]] = field(default_factory=list)
     max_depth: int = 50
-    headings: List[float] = field(default_factory=lambda: [float(i) for i in range(0, 360, 10)])
-    pitches: List[float] = field(default_factory=lambda: [float(i) for i in range(-40, 50, 10)])
-    zooms: List[float] = field(default_factory=lambda: [0.0, 1.0, 1.5, 2.0, 3.0])
+    headings: List[float] = field(default_factory=lambda: [float(i) for i in range(0, 360, 30)])
+    pitches: List[float] = field(default_factory=lambda: [-30.0, -15.0, 0.0, 15.0, 30.0])
+    zooms: List[float] = field(default_factory=lambda: [0.0, 1.0, 2.0])
     db_path: str = "mapcrunch.db"
     image_root: str = "mapcrunch_images"
     viewport_width: int = 1920
@@ -914,7 +959,7 @@ class CaptureConfig:
     skip_existing: bool = True
     resume: bool = False
     api_key: Optional[str] = None
-    concurrency: int = 4
+    concurrency: int = 8
 
 
 class MapCrunchOrchestrator:
@@ -1069,14 +1114,27 @@ class MapCrunchOrchestrator:
 
         Returns (captured, skipped, errors).
         """
+        from playwright._impl._errors import TargetClosedError
+
         if not self.capture._browser:
             await self.capture.start()
 
         sem = asyncio.Semaphore(self.config.concurrency)
+        restart_lock = asyncio.Lock()
         total = len(all_pending)
 
         # Shared counters (safe because asyncio is single-threaded)
         counters = {"captured": 0, "skipped": 0, "errors": 0, "done": 0}
+
+        async def _ensure_browser() -> None:
+            """Restart the browser if it crashed. Only one task restarts at a time."""
+            async with restart_lock:
+                try:
+                    # Quick check — if new_context works, browser is alive
+                    ctx = await self.capture._browser.new_context()
+                    await ctx.close()
+                except Exception:
+                    await self.capture.restart()
 
         async def _process_one(idx: int, job_id: int, pano: Dict[str, Any]) -> None:
             pano_id = pano["pano_id"]
@@ -1116,10 +1174,28 @@ class MapCrunchOrchestrator:
                 idx, total, pano_id, len(angles),
             )
 
-            async with sem:
-                results = await self.capture.capture_pano(
-                    pano_id, lat, lng, angles, self.config.image_root,
-                )
+            for attempt in range(2):  # 1 retry after browser crash
+                try:
+                    async with sem:
+                        results = await self.capture.capture_pano(
+                            pano_id, lat, lng, angles, self.config.image_root,
+                        )
+                    break  # success
+                except TargetClosedError:
+                    if attempt == 0:
+                        logger.warning(
+                            "Browser crashed while capturing pano %s at (%.6f, %.6f) — restarting",
+                            pano_id, lat, lng,
+                        )
+                        await _ensure_browser()
+                        continue
+                    logger.error(
+                        "Browser crashed again for pano %s at (%.6f, %.6f) — giving up",
+                        pano_id, lat, lng,
+                    )
+                    results = []
+            else:
+                results = []
 
             for r in results:
                 self.db.insert_capture(
@@ -1214,17 +1290,16 @@ def main() -> None:
         help="Max BFS depth from each starting point (default: 50)",
     )
     parser.add_argument(
-        "--headings", nargs="+", type=float, default=[float(i) for i in range(0, 360, 10)],
-        help="Heading angles in degrees (default: every 10 deg from 0-350)",
+        "--headings", nargs="+", type=float, default=[float(i) for i in range(0, 360, 30)],
+        help="Heading angles in degrees (default: every 30 deg from 0-330)",
     )
     parser.add_argument(
-        # @HuanzhiMao TODO: Change to -40 to 50?
-        "--pitches", nargs="+", type=float, default=[float(i) for i in range(-30, 40, 10)],
-        help="Pitch angles in degrees (default: every 10 deg from -40 to +40)",
+        "--pitches", nargs="+", type=float, default=[-30.0, -15.0, 0.0, 15.0, 30.0],
+        help="Pitch angles in degrees (default: -30 -15 0 15 30)",
     )
     parser.add_argument(
-        "--zooms", nargs="+", type=float, default=[0.0, 1.0, 1.5, 2.0, 3.0],
-        help="Zoom levels (default: 0 1 1.5 2 3)",
+        "--zooms", nargs="+", type=float, default=[0.0, 1.0, 2.0],
+        help="Zoom levels (default: 0 1 2)",
     )
     parser.add_argument(
         "--db", type=str, default="mapcrunch.db",
@@ -1255,8 +1330,8 @@ def main() -> None:
         help="Resume interrupted jobs from the database",
     )
     parser.add_argument(
-        "--concurrency", type=int, default=4,
-        help="Number of panoramas to capture in parallel (default: 4)",
+        "--concurrency", type=int, default=8,
+        help="Number of panoramas to capture in parallel (default: 8)",
     )
 
     args = parser.parse_args()
