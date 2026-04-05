@@ -1,11 +1,8 @@
 import json
-import os
-import time
-from pickle import NONE
-from tkinter import NO
+import math
+import sqlite3
+import threading
 from typing import Any, Dict, List, Optional
-
-import requests
 
 """
 Shared utilities for executable backend functions.
@@ -54,97 +51,191 @@ class ImageResult:
         }
 
 
+# ---------------------------------------------------------------------------
+# Direction cones (mirrored from core/navigation/pure_nav.py)
+# ---------------------------------------------------------------------------
+
+DIR_CONES = {
+    "N":  [(337.5, 360.0), (0.0, 22.5)],
+    "NE": [(22.5, 67.5)],
+    "E":  [(67.5, 112.5)],
+    "SE": [(112.5, 157.5)],
+    "S":  [(157.5, 202.5)],
+    "SW": [(202.5, 247.5)],
+    "W":  [(247.5, 292.5)],
+    "NW": [(292.5, 337.5)],
+}
+
+_DIR_TO_FULL = {
+    "N": "north", "NE": "northeast", "E": "east", "SE": "southeast",
+    "S": "south", "SW": "southwest", "W": "west", "NW": "northwest",
+}
+
+
+def _normalize_heading(heading: float) -> float:
+    try:
+        x = float(heading)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(x):
+        return 0.0
+    return ((x % 360) + 360) % 360
+
+
+def _heading_to_direction(heading: float) -> str:
+    heading = _normalize_heading(heading)
+    for direction, ranges in DIR_CONES.items():
+        for start, end in ranges:
+            if (start <= heading < end) or (start == 0.0 and heading == 360.0):
+                return direction
+    return "N"
+
+
+def _in_cone(h: float, cones: List[tuple]) -> bool:
+    h = _normalize_heading(h)
+    for lo, hi in cones:
+        if lo <= hi and lo <= h < hi:
+            return True
+        if lo > hi and (h >= lo or h < hi):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Allowed discrete values for scroll and zoom
+# These match the default capture grid from mapcrunch_crawler.py
+# ---------------------------------------------------------------------------
+
+ALLOWED_HEADINGS = [float(i) for i in range(0, 360, 30)]  # 0, 30, 60, ..., 330
+ALLOWED_PITCHES = [-30.0, -15.0, 0.0, 15.0, 30.0]
+ALLOWED_ZOOMS = [0.0, 1.0, 2.0]
+
+# Scroll step sizes (degrees)
+SCROLL_HORIZONTAL_STEP = 30.0  # matches heading grid spacing
+SCROLL_VERTICAL_STEP = 15.0    # matches pitch grid spacing
+ZOOM_STEP = 1.0                # matches zoom grid spacing
+
+
+def _snap_to_nearest(value: float, allowed: List[float]) -> float:
+    """Snap a value to the nearest allowed value."""
+    return min(allowed, key=lambda x: abs(x - value))
+
+
 class StreetViewAPI:
     """
-    StreetView API.
+    StreetView API backed by a local SQLite database.
+
+    Reads panorama data, links, and pre-captured screenshots from the
+    database produced by ``apps/mapcrunch_crawler.py``.
     """
 
-    def __init__(self):
-        """Create a new StreetView API client."""
+    def __init__(self, db_path: str = "mapcrunch.db"):
+        """Create a new StreetView API client.
+
+        Args:
+            db_path (str): Path to the SQLite database produced by the crawler.
+        """
         self._api_description = "This tool belongs to the StreetView API, which is used to navigate and capture street views."
 
-        self._base_url = os.getenv("GEOGUESSR_SERVER_URL", "http://127.0.0.1:18000")
-        self._session = requests.Session()
-        self._timeout = (15, None)  # (connect timeout, read timeout)
-        # The client only retains the session identifier. All other state lives
-        # on the server and can be fetched via GET /state when needed.
+        self._db_path = db_path
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+
+        # Session state
         self.session_id: Optional[str] = None
         self.available_moves: List[str] = None
 
+        # Navigation state
+        self._pano_id: Optional[str] = None
+        self._heading: float = 0.0
+        self._pitch: float = 0.0
+        self._zoom: float = 1.0
+        self._links: List[Dict[str, Any]] = []
+
     # ------------------------------------------------------------------
-    #  helper functions
+    #  Database helpers
     # ------------------------------------------------------------------
 
-    def _post(self, path: str, body: Optional[Dict] = None) -> Dict[str, Any]:
-        """Send a request to the server to get POST.
+    def _query_one(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
 
-        Args:
-            path (str): URL path to append to the base URL.
-            body (Optional[Dict]): JSON body payload. Defaults to `{}`.
+    def _query_all(self, sql: str, params: tuple = ()) -> list:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
 
-        Returns:
-            envelope (Dict[str, Any]): Parsed JSON response envelope from the server.
-        """
-        resp = self._session.post(
-            f"{self._base_url}{path}",
-            json=body or {},
-            timeout=self._timeout,
+    # ------------------------------------------------------------------
+    #  State helpers
+    # ------------------------------------------------------------------
+
+    def _load_links(self) -> List[Dict[str, Any]]:
+        """Load neighbor links for the current panorama."""
+        if not self._pano_id:
+            return []
+
+        # First try metadata_json (authoritative)
+        row = self._query_one(
+            "SELECT metadata_json FROM panoramas WHERE pano_id = ?",
+            (self._pano_id,),
         )
-        resp.raise_for_status()
-        return resp.json()
+        if row and row["metadata_json"]:
+            try:
+                metadata = json.loads(row["metadata_json"])
+                links = metadata.get("links") or []
+                if links:
+                    return links
+            except (json.JSONDecodeError, TypeError):
+                pass
 
-    def _get(self, path: str) -> Dict[str, Any]:
-        """Send a GET request to the server.
-
-        Args:
-            path (str): URL path to append to the base URL.
-
-        Returns:
-            envelope (Dict[str, Any]): Parsed JSON response envelope from the server.
-        """
-        resp = self._session.get(
-            f"{self._base_url}{path}",
-            timeout=self._timeout,
+        # Fall back to panorama_links table
+        link_rows = self._query_all(
+            "SELECT to_pano_id, heading, description, link_date "
+            "FROM panorama_links WHERE from_pano_id = ?",
+            (self._pano_id,),
         )
-        resp.raise_for_status()
-        return resp.json()
+        return [
+            {
+                "panoId": lr["to_pano_id"],
+                "heading": lr["heading"],
+                "description": lr["description"] or "",
+                "date": lr["link_date"],
+            }
+            for lr in link_rows
+        ]
 
-    def _call(self, method: str, path: str, body: Optional[Dict] = None) -> Dict[str, Any]:
-        """Make an HTTP call and unwrap the server envelope.
+    def _compute_available_moves(self) -> List[str]:
+        """Compute available moves based on current links and state."""
+        move_actions = []
+        for link in self._links:
+            move_heading = float(link["heading"])
+            direction = _heading_to_direction(move_heading)
+            action = f"move_{_DIR_TO_FULL[direction]}"
+            if action not in move_actions:
+                move_actions.append(action)
 
-        Args:
-            method (str): HTTP method, either ``"GET"`` or ``"POST"``.
-            path (str): URL path to append to the base URL.
-            body (Optional[Dict]): JSON body for POST requests. Ignored for GET.
+        universal_actions = [
+            "capture_view",
+            "scroll_up",
+            "scroll_left",
+            "scroll_right",
+            "scroll_down",
+            "zoom_in",
+            "zoom_out",
+        ]
+        return universal_actions + move_actions
 
-        Returns:
-            updates (Dict[str, Any]): The ``updates`` dict extracted from the
-                server response envelope.
+    def _update_state_after_move(self) -> None:
+        """Refresh links and available moves after a panorama change."""
+        self._links = self._load_links()
+        self.available_moves = self._compute_available_moves()
 
-        Raises:
-            RuntimeError: On network errors or when the server returns ``ok=false``.
-        """
-        try:
-            if method == "GET":
-                envelope = self._get(path)
-            else:
-                envelope = self._post(path, body)
-        except requests.RequestException as e:
-            raise RuntimeError(str(e))
-        except ValueError as e:
-            raise RuntimeError(f"Server returned non-JSON response: {e}")
+    def _get_updated_tool_list(self) -> List[str]:
+        return self.available_moves
 
-        if not envelope.get("ok"):
-            msg = (envelope.get("error") or {}).get("message", "Unknown server error")
-            raise RuntimeError(msg)
-
-        updates = envelope.get("updates", {})
-        # Only keep track of the session id client-side.
-        sid = updates.get("session_id")
-        if sid:
-            self.session_id = sid
-            self._session.headers["X-Session-ID"] = sid
-        return updates
+    # ------------------------------------------------------------------
+    # Core Connection / Setup
+    # ------------------------------------------------------------------
 
     def _load_scenario(
         self,
@@ -154,66 +245,39 @@ class StreetViewAPI:
         """
         Set the starting coordinates for the scenario.
         Args:
-            scenario (Dict[str, float]): Configuration dict. Forwarded to the server.
+            scenario (Dict[str, float]): Configuration dict with lat/lng keys.
         """
-        while True:
-            try:
-                self._connect_host()
-                result = self._call("POST", "/init_panorama", scenario)
-                self.available_moves = result.get("available_moves", [])
-                return result
-            except RuntimeError as e:
-                print(
-                    f"WARNING: Failed to connect to server: {e}. Retrying in 5 seconds..."
-                )
-                time.sleep(5)
+        lat = scenario.get("lat", 0.0)
+        lng = scenario.get("lng", 0.0)
+        heading = scenario.get("heading", 0.0)
+        pitch = scenario.get("pitch", 0.0)
+        zoom = scenario.get("zoom", 1.0)
+
+        # Snap to nearest panorama in the database
+        row = self._query_one(
+            "SELECT pano_id, lat, lng FROM panoramas "
+            "WHERE lat IS NOT NULL AND lng IS NOT NULL "
+            "ORDER BY (lat - ?) * (lat - ?) + (lng - ?) * (lng - ?) "
+            "LIMIT 1",
+            (lat, lat, lng, lng),
+        )
+        if not row:
+            raise RuntimeError("No panoramas in local database")
+
+        self._pano_id = row["pano_id"]
+        self._heading = _snap_to_nearest(_normalize_heading(heading), ALLOWED_HEADINGS)
+        self._pitch = _snap_to_nearest(pitch, ALLOWED_PITCHES)
+        self._zoom = _snap_to_nearest(zoom, ALLOWED_ZOOMS)
+        self._update_state_after_move()
+
+        return {
+            "available_moves": self.available_moves,
+        }
 
     def __eq__(self, value: object) -> bool:
-        """Check equality based on session identity.
-
-        Args:
-            value (object): Object to compare against.
-
-        Returns:
-            is_equal (bool): ``True`` if *value* is a ``StreetViewAPI`` instance
-                with the same base URL and session id.
-        """
         if not isinstance(value, StreetViewAPI):
             return False
-        return (self._base_url, self.session_id) == (value._base_url, value.session_id)
-
-    def _get_updated_tool_list(self) -> List[str]:
-        return self.available_moves
-
-    # ------------------------------------------------------------------
-    # Core Connection / Setup
-    # ------------------------------------------------------------------
-
-    def _connect_host(self, session_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Start a Street View host session on the server.
-
-        Args:
-            session_id (Optional[str]): Desired session identifier. The server
-                generates one automatically when ``None``.
-
-        Returns:
-            - session_id (str): Assigned session identifier.
-        """
-        body: Dict[str, Any] = {}
-        if os.getenv("GOOGLE_MAPS_API_KEY"):
-            body["api_key"] = os.getenv("GOOGLE_MAPS_API_KEY")
-        if os.getenv("GOOGLE_MAPS_URL_SIGNING_SECRET"):
-            body["url_signing_secret"] = os.getenv("GOOGLE_MAPS_URL_SIGNING_SECRET")
-        if session_id:
-            body["session_id"] = session_id
-        result = self._call("POST", "/connect", body)
-        # Pin session header so all subsequent requests route to this engine
-        sid = result.get("session_id") or self.session_id
-        if sid:
-            self._session.headers["X-Session-ID"] = sid
-            self.session_id = sid
-        return result
+        return (self._db_path, self._pano_id) == (value._db_path, value._pano_id)
 
     # ------------------------------------------------------------------
     # Checks
@@ -226,19 +290,9 @@ class StreetViewAPI:
         Returns:
             - description (str): where is the direction facing at the current state(e.g. ``"Facing N (0.0 degrees)"``).
         """
-        result = self._call("GET", "/check/direction")
-        self.available_moves = result.get("available_moves", [])
-        return {"description": result.get("description", "")}
-
-    # def check_available_moves(self) -> Dict[str, Any]:
-    #     """Check which compass-direction moves are currently available.
-
-    #     Returns:
-    #         - available_moves (List[str]): List of permitted action names.
-    #             Includes scroll, zoom actions and directional moves functions (N, NE, E, SE, S, SW, W, NW).
-    #     """
-    #     available_moves = self._call("GET", "/check/available_moves")
-    #     return available_moves
+        direction = _heading_to_direction(self._heading)
+        description = f"Facing {direction} ({self._heading:.1f} degrees)"
+        return {"description": description}
 
     # ------------------------------------------------------------------
     # Capture
@@ -248,14 +302,56 @@ class StreetViewAPI:
         """
         Capture the current panorama image. Returns an image of the current panorama.
         """
-        result = self._call("POST", "/capture/view")
-        return ImageResult(
-            image_base64=result.get("image_base64", ""), mime_type="image/jpeg"
+        if not self._pano_id:
+            raise RuntimeError("No panorama loaded — call _load_scenario first")
+
+        # Look up the pre-captured screenshot from the database
+        row = self._query_one(
+            "SELECT image_path FROM captures "
+            "WHERE pano_id = ? AND heading = ? AND pitch = ? AND zoom = ? "
+            "AND image_path IS NOT NULL "
+            "LIMIT 1",
+            (self._pano_id, self._heading, self._pitch, self._zoom),
         )
+        if not row:
+            raise RuntimeError(
+                f"No captured image for pano={self._pano_id} "
+                f"heading={self._heading} pitch={self._pitch} zoom={self._zoom}"
+            )
+
+        image_path = row["image_path"]
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        return ImageResult(image_bytes=image_bytes, mime_type="image/jpeg")
 
     # ------------------------------------------------------------------
     # Movements
     # ------------------------------------------------------------------
+
+    def _move_direction(self, direction_key: str) -> Dict[str, Any]:
+        """Move to the adjacent panorama in the given compass direction."""
+        candidates = [
+            link for link in self._links
+            if _in_cone(link["heading"], DIR_CONES[direction_key])
+        ]
+        if not candidates:
+            raise RuntimeError(f"No moves available in {_DIR_TO_FULL[direction_key]} direction")
+
+        target = candidates[0]
+        next_pano_id = target["panoId"]
+
+        # Verify the target panorama exists in our database
+        row = self._query_one(
+            "SELECT pano_id FROM panoramas WHERE pano_id = ?",
+            (next_pano_id,),
+        )
+        if not row:
+            raise RuntimeError(f"Target panorama {next_pano_id} not found in local database")
+
+        self._pano_id = next_pano_id
+        self._update_state_after_move()
+        return {"status": "success"}
 
     def move_north(self) -> Dict[str, Any]:
         """
@@ -264,9 +360,7 @@ class StreetViewAPI:
         Returns:
             status (bool): True if the operation is successful, False otherwise.
         """
-        result = self._call("POST", "/move/north")
-        self.available_moves = result.get("available_moves", [])
-        return {"status": "success"}
+        return self._move_direction("N")
 
     def move_northeast(self) -> Dict[str, Any]:
         """
@@ -275,9 +369,7 @@ class StreetViewAPI:
         Returns:
             status (bool): True if the operation is successful, False otherwise.
         """
-        result = self._call("POST", "/move/northeast")
-        self.available_moves = result.get("available_moves", [])
-        return {"status": "success"}
+        return self._move_direction("NE")
 
     def move_east(self) -> Dict[str, Any]:
         """
@@ -286,9 +378,7 @@ class StreetViewAPI:
         Returns:
             status (bool): True if the operation is successful, False otherwise.
         """
-        result = self._call("POST", "/move/east")
-        self.available_moves = result.get("available_moves", [])
-        return {"status": "success"}
+        return self._move_direction("E")
 
     def move_southeast(self) -> Dict[str, Any]:
         """
@@ -297,9 +387,7 @@ class StreetViewAPI:
         Returns:
             status (bool): True if the operation is successful, False otherwise.
         """
-        result = self._call("POST", "/move/southeast")
-        self.available_moves = result.get("available_moves", [])
-        return {"status": "success"}
+        return self._move_direction("SE")
 
     def move_south(self) -> Dict[str, Any]:
         """
@@ -308,9 +396,7 @@ class StreetViewAPI:
         Returns:
             status (bool): True if the operation is successful, False otherwise.
         """
-        result = self._call("POST", "/move/south")
-        self.available_moves = result.get("available_moves", [])
-        return {"status": "success"}
+        return self._move_direction("S")
 
     def move_southwest(self) -> Dict[str, Any]:
         """
@@ -319,9 +405,7 @@ class StreetViewAPI:
         Returns:
             status (bool): True if the operation is successful, False otherwise.
         """
-        result = self._call("POST", "/move/southwest")
-        self.available_moves = result.get("available_moves", [])
-        return {"status": "success"}
+        return self._move_direction("SW")
 
     def move_west(self) -> Dict[str, Any]:
         """
@@ -330,9 +414,7 @@ class StreetViewAPI:
         Returns:
             status (bool): True if the operation is successful, False otherwise.
         """
-        result = self._call("POST", "/move/west")
-        self.available_moves = result.get("available_moves", [])
-        return {"status": "success"}
+        return self._move_direction("W")
 
     def move_northwest(self) -> Dict[str, Any]:
         """
@@ -341,82 +423,66 @@ class StreetViewAPI:
         Returns:
             status (bool): True if the operation is successful, False otherwise.
         """
-        result = self._call("POST", "/move/northwest")
-        self.available_moves = result.get("available_moves", [])
-        return {"status": "success"}
+        return self._move_direction("NW")
 
     # ------------------------------------------------------------------
-    # Scroll (camera rotation)
+    # Scroll (camera rotation) — snapped to allowed grid values
     # ------------------------------------------------------------------
 
-    def scroll_left(self, deg: float) -> Dict[str, Any]:
+    def scroll_left(self) -> Dict[str, Any]:
         """
-        Rotate the camera view to the left (counter-clockwise). Returns an image of the view.
-
-        Args:
-            deg (float): Degrees to rotate left. Positive value expected; negative values are treated as their absolute value.
+        Rotate the camera view to the left (counter-clockwise) by one step. Returns an image of the view.
         """
-        result = self._call("POST", "/scroll/left", {"delta": deg})
-        self.available_moves = result.get("available_moves", [])
+        new_heading = _normalize_heading(self._heading - SCROLL_HORIZONTAL_STEP)
+        self._heading = _snap_to_nearest(new_heading, ALLOWED_HEADINGS)
         return self.capture_view()
 
-    def scroll_right(self, deg: float) -> Dict[str, Any]:
+    def scroll_right(self) -> Dict[str, Any]:
         """
-        Rotate the camera view to the right (clockwise). Returns an image of the view.
-
-        Args:
-            deg (float): Degrees to rotate right. Positive value expected; negative values are treated as their absolute value.
+        Rotate the camera view to the right (clockwise) by one step. Returns an image of the view.
         """
-        result = self._call("POST", "/scroll/right", {"delta": deg})
-        self.available_moves = result.get("available_moves", [])
+        new_heading = _normalize_heading(self._heading + SCROLL_HORIZONTAL_STEP)
+        self._heading = _snap_to_nearest(new_heading, ALLOWED_HEADINGS)
         return self.capture_view()
 
-    def scroll_up(self, deg: float) -> Dict[str, Any]:
+    def scroll_up(self) -> Dict[str, Any]:
         """
-        Tilt the camera view upward. Returns an image of the view.
-
-        Args:
-            deg (float): Degrees to tilt up. Clamped so the resulting pitch does not exceed 90.
+        Tilt the camera view upward by one step. Returns an image of the view.
         """
-        result = self._call("POST", "/scroll/up", {"delta": deg})
-        self.available_moves = result.get("available_moves", [])
+        idx = ALLOWED_PITCHES.index(self._pitch) if self._pitch in ALLOWED_PITCHES else 2
+        if idx < len(ALLOWED_PITCHES) - 1:
+            self._pitch = ALLOWED_PITCHES[idx + 1]
         return self.capture_view()
 
-    def scroll_down(self, deg: float) -> Dict[str, Any]:
+    def scroll_down(self) -> Dict[str, Any]:
         """
-        Tilt the camera view downward. Returns an image of the view.
-
-        Args:
-            deg (float): Degrees to tilt down. Clamped so the resulting pitch does not go below -90.
+        Tilt the camera view downward by one step. Returns an image of the view.
         """
-        result = self._call("POST", "/scroll/down", {"delta": deg})
-        self.available_moves = result.get("available_moves", [])
+        idx = ALLOWED_PITCHES.index(self._pitch) if self._pitch in ALLOWED_PITCHES else 2
+        if idx > 0:
+            self._pitch = ALLOWED_PITCHES[idx - 1]
         return self.capture_view()
 
     # ------------------------------------------------------------------
-    # Zoom
+    # Zoom — snapped to allowed grid values
     # ------------------------------------------------------------------
 
-    def zoom_in(self, delta: float) -> Dict[str, Any]:
+    def zoom_in(self) -> Dict[str, Any]:
         """
-        Zoom the camera view in (increase magnification). Returns an image of the view.
-
-        Args:
-            delta (float): Zoom increment to add. Positive value expected; negative values are treated as their absolute value.
+        Zoom the camera view in (increase magnification) by one step. Returns an image of the view.
         """
-        result = self._call("POST", "/zoom/in", {"delta": delta})
-        self.available_moves = result.get("available_moves", [])
+        idx = ALLOWED_ZOOMS.index(self._zoom) if self._zoom in ALLOWED_ZOOMS else 0
+        if idx < len(ALLOWED_ZOOMS) - 1:
+            self._zoom = ALLOWED_ZOOMS[idx + 1]
         return self.capture_view()
 
-    def zoom_out(self, delta: float) -> Dict[str, Any]:
+    def zoom_out(self) -> Dict[str, Any]:
         """
-        Zoom the camera view out (decrease magnification). Returns an image of the view.
-
-        Args:
-            delta (float): Zoom decrement to subtract. Positive value expected; negative values are treated as their absolute value. The resulting zoom level is clamped at 0.
+        Zoom the camera view out (decrease magnification) by one step. Returns an image of the view.
         """
-        result = self._call("POST", "/zoom/out", {"delta": delta})
-        self.available_moves = result.get("available_moves", [])
+        idx = ALLOWED_ZOOMS.index(self._zoom) if self._zoom in ALLOWED_ZOOMS else 0
+        if idx > 0:
+            self._zoom = ALLOWED_ZOOMS[idx - 1]
         return self.capture_view()
 
     # ------------------------------------------------------------------
@@ -424,9 +490,12 @@ class StreetViewAPI:
     # ------------------------------------------------------------------
 
     def _end_session(self) -> Dict[str, Any]:
-        """End the current session on the server and clear local session id."""
-        result = self._call("POST", "/end_session")
-        # Server drops the session. Clear client-side session routing info.
+        """End the current session and reset state."""
+        self._pano_id = None
+        self._heading = 0.0
+        self._pitch = 0.0
+        self._zoom = 1.0
+        self._links = []
+        self.available_moves = None
         self.session_id = None
-        self._session.headers.pop("X-Session-ID", None)
-        return result
+        return {"closed": True}
