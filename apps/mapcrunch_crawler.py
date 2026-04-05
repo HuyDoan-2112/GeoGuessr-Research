@@ -880,10 +880,11 @@ class MapCrunchCapture:
 
     @staticmethod
     async def _goto_with_retry(
-        page: Any, url: str, max_retries: int = 3, base_delay: float = 5.0,
+        page: Any, url: str, base_delay: float = 5.0, max_delay: float = 60.0,
     ) -> None:
-        """Navigate to URL with exponential backoff on connection errors."""
-        for attempt in range(max_retries):
+        """Navigate to URL with infinite retry + exponential backoff on connection errors."""
+        attempt = 0
+        while True:
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 return
@@ -894,12 +895,13 @@ class MapCrunchCapture:
                     or "ERR_CONNECTION_RESET" in err_str
                     or "ERR_CONNECTION_TIMED_OUT" in err_str
                 )
-                if not is_connection_error or attempt == max_retries - 1:
+                if not is_connection_error:
                     raise
-                delay = base_delay * (2 ** attempt)
+                attempt += 1
+                delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
                 logger.warning(
-                    "Connection error (attempt %d/%d), retrying in %.0fs: %s",
-                    attempt + 1, max_retries, delay, err_str[:120],
+                    "Connection error (attempt %d), retrying in %.0fs: %s",
+                    attempt, delay, err_str[:120],
                 )
                 await asyncio.sleep(delay)
 
