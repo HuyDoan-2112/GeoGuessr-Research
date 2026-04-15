@@ -950,14 +950,18 @@ class CaptureConfig:
     starting_points: List[Tuple[float, float]] = field(default_factory=list)
     max_depth: int = 50
     headings: List[float] = field(default_factory=lambda: [float(i) for i in range(0, 360, 30)])
-    pitches: List[float] = field(default_factory=lambda: [-30.0, -15.0, 0.0, 15.0, 30.0])
+    pitches: List[float] = field(default_factory=lambda: [-20.0, 0.0, 20.0])
     zooms: List[float] = field(default_factory=lambda: [0.0, 1.0, 2.0])
+    # headings: List[float] = field(default_factory=lambda: [float(i) for i in range(0, 360, 30)])
+    # pitches: List[float] = field(default_factory=lambda: [-30.0, -15.0, 0.0, 15.0, 30.0])
+    # zooms: List[float] = field(default_factory=lambda: [0.0, 1.0, 2.0])
     db_path: str = "mapcrunch.db"
     image_root: str = "mapcrunch_images"
     viewport_width: int = 1920
     viewport_height: int = 1080
     headless: bool = True
-    quality: int = 95
+    quality: int = 85
+    # quality: int = 95
     skip_existing: bool = True
     resume: bool = False
     api_key: Optional[str] = None
