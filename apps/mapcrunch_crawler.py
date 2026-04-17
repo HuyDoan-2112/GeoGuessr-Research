@@ -1046,7 +1046,7 @@ class MapCrunchOrchestrator:
                 )
 
                 existing = self.db.find_existing_job(lat, lng)
-                if existing and existing["status"] == "completed":
+                if existing and existing["status"] in ("completed", "capturing"):
                     job_id = existing["job_id"]
                     pending = self.db.get_pending_panos(job_id)
                     if not pending:
@@ -1151,7 +1151,7 @@ class MapCrunchOrchestrator:
                 try:
                     await page.goto(
                         f"{MAPCRUNCH_BASE}/p/{warmup_lat}_{warmup_lng}_0_0_1",
-                        wait_until="networkidle", timeout=30_000,
+                        wait_until="domcontentloaded", timeout=30_000,
                     )
                     await page.wait_for_function(
                         "window.google && window.google.maps", timeout=20_000,
