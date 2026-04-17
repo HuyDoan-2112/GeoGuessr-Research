@@ -27,7 +27,9 @@ def is_retryable_http_error(exception: BaseException) -> bool:
         return True
 
     if isinstance(exception, requests.exceptions.HTTPError):
-        status = exception.response.status_code if exception.response else None
+        # NB: use `is not None` — Response.__bool__ returns self.ok, which is
+        # False for 4xx/5xx, so a truthy-check would drop every retryable error.
+        status = exception.response.status_code if exception.response is not None else None
         return status in RETRYABLE_STATUS_CODES
 
     return False

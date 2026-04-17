@@ -357,7 +357,7 @@ class CaptureDatabase:
     """
 
     def __init__(self, db_path: str) -> None:
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(self.SCHEMA)
@@ -824,6 +824,15 @@ class MapCrunchCapture:
 
             await page.add_style_tag(content=OVERLAY_HIDE_CSS)
             cfg = await page.evaluate(FIND_AND_CONFIGURE_PANORAMA_JS)
+
+            # Retry up to 3 times if panorama object not found yet (timing issue)
+            if not cfg.get("found"):
+                for _retry in range(3):
+                    await asyncio.sleep(1.0)
+                    cfg = await page.evaluate(FIND_AND_CONFIGURE_PANORAMA_JS)
+                    if cfg.get("found"):
+                        break
+
             await page.evaluate(DOM_CLEANUP_JS)
             await page.evaluate(RESIZE_PANORAMA_JS)
 
@@ -1125,6 +1134,34 @@ class MapCrunchOrchestrator:
         if not self.capture._browser:
             await self.capture.start()
 
+        # Warm up the browser cache by loading one page first.
+        # Without this, all concurrent pages hit a cold cache and
+        # fail to find the panorama object before Google Maps JS loads.
+        if all_pending:
+            first_pano = all_pending[0][1]
+            warmup_lat, warmup_lng = first_pano["lat"], first_pano["lng"]
+            if warmup_lat is not None and warmup_lng is not None:
+                logger.info("Warming up browser cache...")
+                ctx = await self.capture._browser.new_context(
+                    viewport={"width": 800, "height": 600},
+                    locale="en-US",
+                    user_agent=CHROME_USER_AGENT,
+                )
+                page = await ctx.new_page()
+                try:
+                    await page.goto(
+                        f"{MAPCRUNCH_BASE}/p/{warmup_lat}_{warmup_lng}_0_0_1",
+                        wait_until="networkidle", timeout=30_000,
+                    )
+                    await page.wait_for_function(
+                        "window.google && window.google.maps", timeout=20_000,
+                    )
+                    logger.info("Browser cache warmed up")
+                except Exception as e:
+                    logger.warning("Cache warm-up failed (non-fatal): %s", e)
+                finally:
+                    await ctx.close()
+
         sem = asyncio.Semaphore(self.config.concurrency)
         restart_lock = asyncio.Lock()
         total = len(all_pending)
@@ -1175,14 +1212,13 @@ class MapCrunchOrchestrator:
                 counters["done"] += 1
                 return
 
-            logger.info(
-                "[%d/%d] Pano %s: capturing %d angles",
-                idx, total, pano_id, len(angles),
-            )
-
             for attempt in range(2):  # 1 retry after browser crash
                 try:
                     async with sem:
+                        logger.info(
+                            "[%d/%d] Pano %s: capturing %d angles",
+                            idx, total, pano_id, len(angles),
+                        )
                         results = await self.capture.capture_pano(
                             pano_id, lat, lng, angles, self.config.image_root,
                         )
