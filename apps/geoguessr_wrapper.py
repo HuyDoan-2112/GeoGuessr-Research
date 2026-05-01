@@ -116,9 +116,13 @@ SCROLL_VERTICAL_STEP = 15.0    # matches pitch grid spacing
 ZOOM_STEP = 1.0                # matches zoom grid spacing
 
 
-def _snap_to_nearest(value: float, allowed: List[float]) -> float:
-    """Snap a value to the nearest allowed value."""
-    return min(allowed, key=lambda x: abs(x - value))
+def _validate_in_allowed(value: float, allowed: List[float], name: str) -> float:
+    """Return value if it is in the allowed list, else raise ValueError."""
+    if value not in allowed:
+        raise ValueError(
+            f"Invalid {name} value {value}; must be one of {allowed}"
+        )
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +215,7 @@ class StreetViewAPI:
         self,
         db_path: str = "mapcrunch.db",
         gcs_bucket: Optional[str] = None,
+        gcs_prefix: Optional[str] = None,
         cache_dir: Optional[str] = None,
         cache_size_gb: Optional[float] = None,
     ):
@@ -218,9 +223,13 @@ class StreetViewAPI:
 
         Args:
             db_path: Path to the SQLite database produced by the crawler.
-            gcs_bucket: Optional GCS bucket containing ``{pano_id}/{heading}_{pitch}_{zoom}.jpg``
-                images. Falls back to ``MAPCRUNCH_GCS_BUCKET`` env var. When unset,
+            gcs_bucket: Optional GCS bucket containing
+                ``{prefix}{pano_id}/{heading}_{pitch}_{zoom}.jpg`` images.
+                Falls back to ``MAPCRUNCH_GCS_BUCKET`` env var. When unset,
                 images are read from the local ``image_path`` recorded in the DB.
+            gcs_prefix: Optional prefix inside the bucket (e.g. ``mapcrunch_images/``).
+                Falls back to ``MAPCRUNCH_GCS_PREFIX`` env var, then to
+                ``mapcrunch_images/`` to match the default upload layout.
             cache_dir: Optional directory for a persistent on-disk image cache.
                 Falls back to ``MAPCRUNCH_CACHE_DIR`` env var. Only used when
                 fetching from GCS.
@@ -240,6 +249,13 @@ class StreetViewAPI:
         if bucket_name:
             from google.cloud import storage  # lazy import
             self._gcs_bucket = storage.Client().bucket(bucket_name)
+
+        prefix = gcs_prefix if gcs_prefix is not None else os.environ.get(
+            "MAPCRUNCH_GCS_PREFIX", "mapcrunch_images/"
+        )
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        self._gcs_prefix = prefix
 
         cache_path = cache_dir or os.environ.get("MAPCRUNCH_CACHE_DIR")
         if cache_size_gb is None:
@@ -352,8 +368,18 @@ class StreetViewAPI:
     ) -> None:
         """
         Set the starting coordinates for the scenario.
+
         Args:
-            scenario (Dict[str, float]): Configuration dict with lat/lng keys.
+            scenario (Dict[str, float]): Configuration dict with the following keys:
+                - lat (float): Starting latitude. Snapped to the nearest panorama in the database.
+                - lng (float): Starting longitude. Snapped to the nearest panorama in the database.
+                - heading (float): Camera heading in degrees. Must be one of
+                    [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330]
+                    (after mod-360 normalization). Raises ValueError otherwise.
+                - pitch (float): Camera pitch in degrees. Must be one of
+                    [-30, -15, 0, 15, 30]. Raises ValueError otherwise.
+                - zoom (float): Camera zoom level. Must be one of [0, 1, 2].
+                    Raises ValueError otherwise.
         """
         lat = scenario.get("lat", 0.0)
         lng = scenario.get("lng", 0.0)
@@ -373,9 +399,11 @@ class StreetViewAPI:
             raise RuntimeError("No panoramas in local database")
 
         self._pano_id = row["pano_id"]
-        self._heading = _snap_to_nearest(_normalize_heading(heading), ALLOWED_HEADINGS)
-        self._pitch = _snap_to_nearest(pitch, ALLOWED_PITCHES)
-        self._zoom = _snap_to_nearest(zoom, ALLOWED_ZOOMS)
+        self._heading = _validate_in_allowed(
+            _normalize_heading(heading), ALLOWED_HEADINGS, "heading",
+        )
+        self._pitch = _validate_in_allowed(pitch, ALLOWED_PITCHES, "pitch")
+        self._zoom = _validate_in_allowed(zoom, ALLOWED_ZOOMS, "zoom")
         self._update_state_after_move()
 
         return {
@@ -410,7 +438,10 @@ class StreetViewAPI:
         self, pano_id: str, heading: float, pitch: float, zoom: float
     ) -> bytes:
         """Return JPEG bytes for a capture, checking cache then GCS then local DB."""
-        key = f"{pano_id}/{heading}_{pitch}_{zoom}.jpg"
+        # Pano IDs in the DB end with `.` (base64 padding); on disk and in
+        # GCS the upload layout sanitizes that to `_`.
+        safe_pano = pano_id.replace(".", "_")
+        key = f"{self._gcs_prefix}{safe_pano}/{heading}_{pitch}_{zoom}.jpg"
 
         if self._cache is not None:
             cached = self._cache.get(key)
@@ -556,36 +587,50 @@ class StreetViewAPI:
 
     def scroll_left(self) -> Dict[str, Any]:
         """
-        Rotate the camera view to the left (counter-clockwise) by one step. Returns an image of the view.
+        Rotate the camera view to the left (decrease heading) by 30 degrees,
+        wrapping around 360. Heading values cycle through
+        [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330].
+        Returns an image of the view.
         """
-        new_heading = _normalize_heading(self._heading - SCROLL_HORIZONTAL_STEP)
-        self._heading = _snap_to_nearest(new_heading, ALLOWED_HEADINGS)
+        self._heading = _normalize_heading(self._heading - SCROLL_HORIZONTAL_STEP)
         return self.capture_view()
 
     def scroll_right(self) -> Dict[str, Any]:
         """
-        Rotate the camera view to the right (clockwise) by one step. Returns an image of the view.
+        Rotate the camera view to the right (increase heading) by 30 degrees,
+        wrapping around 360. Heading values cycle through
+        [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330].
+        Returns an image of the view.
         """
-        new_heading = _normalize_heading(self._heading + SCROLL_HORIZONTAL_STEP)
-        self._heading = _snap_to_nearest(new_heading, ALLOWED_HEADINGS)
+        self._heading = _normalize_heading(self._heading + SCROLL_HORIZONTAL_STEP)
         return self.capture_view()
 
     def scroll_up(self) -> Dict[str, Any]:
         """
-        Tilt the camera view upward by one step. Returns an image of the view.
+        Tilt the camera view upward by 15 degrees within the allowed pitch range
+        [-30, -15, 0, 15, 30]. Raises RuntimeError if already at the top.
+        Returns an image of the view.
         """
         idx = ALLOWED_PITCHES.index(self._pitch) if self._pitch in ALLOWED_PITCHES else 2
-        if idx < len(ALLOWED_PITCHES) - 1:
-            self._pitch = ALLOWED_PITCHES[idx + 1]
+        if idx >= len(ALLOWED_PITCHES) - 1:
+            raise RuntimeError(
+                f"Already at maximum pitch ({self._pitch} degrees); cannot scroll up further"
+            )
+        self._pitch = ALLOWED_PITCHES[idx + 1]
         return self.capture_view()
 
     def scroll_down(self) -> Dict[str, Any]:
         """
-        Tilt the camera view downward by one step. Returns an image of the view.
+        Tilt the camera view downward by 15 degrees within the allowed pitch range
+        [-30, -15, 0, 15, 30]. Raises RuntimeError if already at the bottom.
+        Returns an image of the view.
         """
         idx = ALLOWED_PITCHES.index(self._pitch) if self._pitch in ALLOWED_PITCHES else 2
-        if idx > 0:
-            self._pitch = ALLOWED_PITCHES[idx - 1]
+        if idx <= 0:
+            raise RuntimeError(
+                f"Already at minimum pitch ({self._pitch} degrees); cannot scroll down further"
+            )
+        self._pitch = ALLOWED_PITCHES[idx - 1]
         return self.capture_view()
 
     # ------------------------------------------------------------------
@@ -594,20 +639,30 @@ class StreetViewAPI:
 
     def zoom_in(self) -> Dict[str, Any]:
         """
-        Zoom the camera view in (increase magnification) by one step. Returns an image of the view.
+        Zoom the camera view in (increase magnification) by one step within the
+        allowed zoom levels [0, 1, 2]. Raises RuntimeError if already at the
+        maximum zoom. Returns an image of the view.
         """
         idx = ALLOWED_ZOOMS.index(self._zoom) if self._zoom in ALLOWED_ZOOMS else 0
-        if idx < len(ALLOWED_ZOOMS) - 1:
-            self._zoom = ALLOWED_ZOOMS[idx + 1]
+        if idx >= len(ALLOWED_ZOOMS) - 1:
+            raise RuntimeError(
+                f"Already at maximum zoom ({self._zoom}); cannot zoom in further"
+            )
+        self._zoom = ALLOWED_ZOOMS[idx + 1]
         return self.capture_view()
 
     def zoom_out(self) -> Dict[str, Any]:
         """
-        Zoom the camera view out (decrease magnification) by one step. Returns an image of the view.
+        Zoom the camera view out (decrease magnification) by one step within the
+        allowed zoom levels [0, 1, 2]. Raises RuntimeError if already at the
+        minimum zoom. Returns an image of the view.
         """
         idx = ALLOWED_ZOOMS.index(self._zoom) if self._zoom in ALLOWED_ZOOMS else 0
-        if idx > 0:
-            self._zoom = ALLOWED_ZOOMS[idx - 1]
+        if idx <= 0:
+            raise RuntimeError(
+                f"Already at minimum zoom ({self._zoom}); cannot zoom out further"
+            )
+        self._zoom = ALLOWED_ZOOMS[idx - 1]
         return self.capture_view()
 
     # ------------------------------------------------------------------
