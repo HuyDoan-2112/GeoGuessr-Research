@@ -38,3 +38,11 @@ images/
 */test_multi_agents_hard_code
 
 mapcrunch_images/*
+
+# Local SQLite DB (multi-GB, built locally / synced from GCS — never commit)
+mapcrunch.db
+mapcrunch.db-shm
+mapcrunch.db-wal
+
+# Editor
+.vscode/

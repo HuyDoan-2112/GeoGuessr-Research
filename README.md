@@ -1,39 +1,34 @@
 # GeoGuessr Research
 
-Research toolkit for driving Google Street View with a Playwright (Node) host and a Python API/server. Includes a wrapper CLI for quick manual testing and image capture.
+Research toolkit for driving Google Street View with a remote database of panorama + configurations.
 
-## Quickstart (Docker, short)
-1) Set your API key (do not commit it):
-   - PowerShell: `setx GOOGLE_MAPS_API_KEY "YOUR_KEY"` then open a new terminal
-2) Build + run:
-   - `docker compose up --build`
-3) Stop:
-   - `docker compose down`
+## Quickstart (locally hosted server)
+1) Download requirements.txt into a conda env called bfcl_server.
 
-## Wrapper CLI (in Docker)
-Run an interactive CLI against the running server:
+2) Copy paste this into your .env:
+```bash
+# Path A / geoguessr_server_gcs.py configuration
+# Loaded by python-dotenv when running the shim.
+
+# Absolute path to the local SQLite metadata DB (downloaded from GCS once).
+  MAPCRUNCH_DB_PATH=/absolute/path/to/GeoGuessr-Research/mapcrunch.db
+
+# GCS bucket holding the rendered pano JPEGs.
+MAPCRUNCH_GCS_BUCKET=geoguesr
+MAPCRUNCH_GCS_PREFIX=mapcrunch_images/
+
+# Local on-disk LRU cache for fetched JPEGs.
+MAPCRUNCH_CACHE_DIR=/tmp/mapcrunch_cache
+MAPCRUNCH_CACHE_SIZE_GB=5
+
+# ADC requires *some* project for billing; any value works for read-only
+# bucket access on a bucket you don't own.
+GOOGLE_CLOUD_PROJECT=placeholder
+
+# Flask server binding.
+HOST=127.0.0.1
+PORT=18000
 ```
-docker compose exec geoguessr-worker python -m apps.wrapper_cli --base-url http://localhost:8000
-```
 
-Common commands:
-```
-init 37.7749 -122.4194
-move north
-scroll right 30
-zoom in 1
-state
-end
-```
-
-## Outputs
-- Images are saved in `/data/images` inside the container.
-- Compose mounts that path to the `geoguessr-images` volume by default.
-
-## Docs
-- `docs/Run-Instructions-CLI.md`
-- `docs/Run-Instructions-Compose.md`
-
-## Notes
-- Google Maps JS and Street View Static APIs must be enabled with billing.
-- For Apple Silicon, you may need an arm64 Playwright image or emulation.
+## Command to start server:
+command=conda run --no-capture-output -n bfcl_server python -m apps.geoguessr_server_gcs

@@ -122,7 +122,7 @@ def _validate_in_allowed(value: float, allowed: List[float], name: str) -> float
         raise ValueError(
             f"Invalid {name} value {value}; must be one of {allowed}"
         )
-    return value
+    return float(value)
 
 
 # ---------------------------------------------------------------------------
