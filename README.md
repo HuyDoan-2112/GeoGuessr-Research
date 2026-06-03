@@ -5,7 +5,9 @@ Research toolkit for driving Google Street View with a remote database of panora
 ## Quickstart (locally hosted server)
 1) Download requirements.txt into a conda env called bfcl_server.
 
-2) Copy paste this into your .env:
+2) Download mapcrunch.db from the gcs bucket.
+
+3) Copy paste this into your .env:
 ```bash
 # Path A / geoguessr_server_gcs.py configuration
 # Loaded by python-dotenv when running the shim.
