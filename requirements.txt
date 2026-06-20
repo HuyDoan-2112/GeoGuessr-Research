@@ -12,3 +12,4 @@ waitress
 tenacity
 numpy
 playwright
+google-cloud-storage
