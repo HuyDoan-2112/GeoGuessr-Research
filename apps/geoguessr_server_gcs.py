@@ -78,6 +78,18 @@ CACHE_SIZE_GB = float(os.environ.get("MAPCRUNCH_CACHE_SIZE_GB", "5"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "18000"))
 
+# FOV-crop ablation. GEOGUESSR_CROP = off | top | bottom (read once at boot;
+# the running server's value IS the ablation condition, so restart the shim to
+# change it). "top" keeps the upper half (sky/skyline/terrain), "bottom" keeps
+# the lower half (road/signage/ground). "off" returns the full uncropped image.
+CROP_MODE = os.environ.get("GEOGUESSR_CROP", "off").strip().lower()
+if CROP_MODE not in ("off", "top", "bottom"):
+    log.warning(
+        "GEOGUESSR_CROP=%r is invalid (expected off|top|bottom); defaulting to 'off'",
+        CROP_MODE,
+    )
+    CROP_MODE = "off"
+
 if not DB_PATH:
     raise RuntimeError(
         "MAPCRUNCH_DB_PATH is required (absolute path to local mapcrunch.db)."
@@ -207,6 +219,29 @@ def route_check_direction():
     )
 
 
+def _apply_crop(image_base64: str) -> str:
+    """Apply the FOV-crop ablation to a base64 JPEG, per CROP_MODE.
+
+    'top'    -> upper half  (0, 0, W, H//2)   (sky/skyline/terrain)
+    'bottom' -> lower half  (0, H//2, W, H)   (road/signage/ground)
+    'off'    -> returned unchanged.
+
+    Returns raw base64 with NO data-URL prefix (the BFCL client wraps the mime
+    type separately, so a prefix would corrupt the image).
+    """
+    if CROP_MODE == "off":
+        return image_base64
+    im = Image.open(io.BytesIO(base64.b64decode(image_base64)))
+    width, height = im.size
+    if CROP_MODE == "top":
+        im = im.crop((0, 0, width, height // 2))
+    else:  # "bottom"
+        im = im.crop((0, height // 2, width, height))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=95)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
 @app.route("/capture/view", methods=["POST"])
 def route_capture_view():
     api = _get_session()
@@ -217,20 +252,15 @@ def route_capture_view():
     except Exception as e:
         return fail(str(e))
 
-    # # FOV ablation: cut off the bottom vertical half of the image, keeping only
-    # # the top half. Decode -> crop -> re-encode as JPEG so the model receives a
-    # # physically smaller image (W x H/2). This is the single chokepoint every
-    # # captured image passes through, so it covers all navigation paths.
-    # im = Image.open(io.BytesIO(base64.b64decode(img.image_base64)))
-    # width, height = im.size
-    # im = im.crop((0, 0, width, height//2))
-    # buf = io.BytesIO()
-    # im.save(buf, format="JPEG")
-    # cropped_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    # FOV-crop ablation: every captured image passes through this single
+    # chokepoint regardless of navigation path. _apply_crop is a no-op when
+    # CROP_MODE == "off". GCS originals and the disk LRU stay uncropped — the
+    # crop is in-memory on the way out only.
+    image_base64 = _apply_crop(img.image_base64)
 
     return ok(
         {
-            "image_base64": img.image_base64,
+            "image_base64": image_base64,
             "available_moves": api.available_moves or [],
         }
     )
