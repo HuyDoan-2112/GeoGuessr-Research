@@ -1,11 +1,5 @@
-.git
-.gitignore
-.env
-images
-__pycache__/
-*.pyc
-.pytest_cache/
-node_modules/
-adapters/streetview_js/node_modules/
-dist/
-build/
+*
+!requirements.txt
+!apps/
+!apps/*.py
+apps/__pycache__/

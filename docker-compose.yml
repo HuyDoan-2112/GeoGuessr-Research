@@ -1,35 +1,26 @@
 services:
-  streetview-host:
-  # Node.js HTTP server managing Playwright browser + page pool
-    build:
-      context: .
-      dockerfile: Dockerfile.node
-    environment:
-      POOL_SIZE: "20"
-      STREETVIEW_HOST_PORT: "3000"
-    shm_size: "5gb"
-    restart: "no"
-    ports:
-      - "13000:3000"
-
-  geoguessr-worker:
-  # Python Flask server (engines + nav_tools)
+  streetview:
     build:
       context: .
       dockerfile: Dockerfile.python
-    command: ["python3", "-m", "apps.geoguessr_server"]
     environment:
-      IMAGE_OUTPUT_DIR: /data/images
-      SERVER_PORT: "8000"
-      STREETVIEW_HOST_URL: "http://streetview-host:3000"
-      USE_WAITRESS: "true"
+      HOST: 0.0.0.0
+      PORT: "18000"
+      MAPCRUNCH_DB_PATH: /data/mapcrunch.db
+      MAPCRUNCH_GCS_BUCKET: ${MAPCRUNCH_GCS_BUCKET:?Set MAPCRUNCH_GCS_BUCKET}
+      MAPCRUNCH_GCS_PREFIX: ${MAPCRUNCH_GCS_PREFIX:-mapcrunch_images/}
+      MAPCRUNCH_CACHE_DIR: /cache
+      MAPCRUNCH_CACHE_SIZE_GB: ${MAPCRUNCH_CACHE_SIZE_GB:-5}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:?Set GOOGLE_CLOUD_PROJECT}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp.json
+      GEOGUESSR_CROP: ${GEOGUESSR_CROP:-off}
+      SERVER_THREADS: ${SERVER_THREADS:-8}
     volumes:
-      - geoguessr-images:/data/images
-    depends_on:
-      - streetview-host
-    restart: "no"
+      - ${MAPCRUNCH_DB_PATH:?Set MAPCRUNCH_DB_PATH}:/data/mapcrunch.db:ro
+      - ${GOOGLE_APPLICATION_CREDENTIALS:?Set GOOGLE_APPLICATION_CREDENTIALS}:/run/secrets/gcp.json:ro
+      - streetview-cache:/cache
     ports:
-      - "18000:8000"
+      - "127.0.0.1:18000:18000"
 
 volumes:
-  geoguessr-images:
+  streetview-cache:

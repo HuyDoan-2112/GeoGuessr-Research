@@ -1,48 +1,22 @@
-# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
 .venv/
 env/
 venv/
 *.egg-info/
-
-# Node
-node_modules/
-npm-debug.log*
-yarn.lock
-pnpm-lock.yaml
-
-# Playwright
-playwright-report/
-test-results/
-
-# Env / secrets
 .env
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Logs
-# *.log
-
-# Images
-images/
-
-# Local tools with secrets
-./docs
-*.md
-./runs
-*events.jsonl
-*/test_multi_agents_hard_code
-
-mapcrunch_images/*
-
-# Local SQLite DB (multi-GB, built locally / synced from GCS — never commit)
-mapcrunch.db
-mapcrunch.db-shm
-mapcrunch.db-wal
-
-# Editor
 .vscode/
+
+# Local data and outputs are not part of the service.
+*.db
+*.db-shm
+*.db-wal
+images/
+crawl_images/
+mapcrunch_images/
+test_mapcrunch_single_images/
+node_modules/
+.claude/

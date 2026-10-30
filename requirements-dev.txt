@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8,<10
+requests>=2,<3
+ruff>=0.9
