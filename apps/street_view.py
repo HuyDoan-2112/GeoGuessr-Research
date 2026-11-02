@@ -25,6 +25,7 @@ DIRECTIONS = (
 )
 UNIVERSAL_ACTIONS = (
     "capture_view",
+    "check_direction",
     "scroll_up",
     "scroll_left",
     "scroll_right",

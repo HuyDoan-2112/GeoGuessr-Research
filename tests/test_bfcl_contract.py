@@ -19,7 +19,7 @@ DIRECTIONS = (
     "south", "southwest", "west", "northwest",
 )
 UNIVERSAL_ACTIONS = {
-    "capture_view", "scroll_up", "scroll_left", "scroll_right",
+    "capture_view", "check_direction", "scroll_up", "scroll_left", "scroll_right",
     "scroll_down", "zoom_in", "zoom_out",
 }
 BFCL_PATH = (
@@ -546,6 +546,7 @@ def test_real_bfcl_client_lifecycle(server, bfcl_client_class, monkeypatch):
     assert api.session_id
     assert api._session.headers["X-Session-ID"] == api.session_id
     assert "move_north" in api._get_updated_tool_list()
+    assert "check_direction" in api._get_updated_tool_list()
     assert api.check_direction() == {"description": "Facing N (0.0 degrees)"}
     assert api.capture_view().image_bytes == images.jpeg
 

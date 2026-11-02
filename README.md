@@ -35,6 +35,24 @@ variables take precedence. `HOST`, `PORT`, and `SERVER_THREADS` control the
 Waitress server. This service keeps sessions in one process; use threads for
 concurrent BFCL clients.
 
+`SERVER_THREADS` controls the number of requests processed at once.
+`SERVER_CONNECTION_LIMIT` separately controls accepted HTTP connections, including
+idle keep-alive connections (default `100`). Increasing `SERVER_THREADS` does not
+increase that connection limit. Waitress normally closes idle HTTP connections
+after 120 seconds; navigation sessions survive reconnects.
+
+BFCL defaults locally hosted model runs containing GeoGuessr to 8 workers,
+including mixed-category runs. API models default to 1. Independently of
+`--num-threads`, updated BFCL runs on the same machine share an enforced limit of
+8 active GeoGuessr episodes per server. Extra workers wait locally before
+connecting, and the slot stays held until session teardown finishes. OS file
+locks release the slot if a process exits, including when killed. Use the same
+server URL across runs; loopback aliases share one budget. The lock files live
+in `/tmp/bfcl-geoguessr-slots` on Unix, independently of result directories.
+This leaves connection headroom below the default `SERVER_CONNECTION_LIMIT` of
+100. Other clients and runners on different machines need separate coordination.
+Raising the connection limit also requires enough available file descriptors.
+
 SQLite connections are opened only for metadata reads and closed before those
 operations return. Paused or abandoned sessions retain navigation state without
 holding a database connection. Each `/connect` also reclaims sessions idle for

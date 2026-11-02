@@ -80,7 +80,7 @@ def assert_connections_closed(connections):
 def test_nearest_string_coordinates_and_metadata_take_precedence(session):
     result = session.init_panorama("1.01", "2.0", heading="-30", pitch="15", zoom="2")
     assert result["available_moves"] == [
-        "capture_view", "scroll_up", "scroll_left", "scroll_right", "scroll_down",
+        "capture_view", "check_direction", "scroll_up", "scroll_left", "scroll_right", "scroll_down",
         "zoom_in", "zoom_out", "move_north", "move_northeast", "move_east",
     ]
     assert session.check_direction()["description"] == "Facing NW (330.0 degrees)"

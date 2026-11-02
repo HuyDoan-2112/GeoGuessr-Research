@@ -205,4 +205,5 @@ if __name__ == "__main__":
         host=os.getenv("HOST", "127.0.0.1"),
         port=int(os.getenv("PORT", "18000")),
         threads=int(os.getenv("SERVER_THREADS", "8")),
+        connection_limit=int(os.getenv("SERVER_CONNECTION_LIMIT", "100")),
     )
