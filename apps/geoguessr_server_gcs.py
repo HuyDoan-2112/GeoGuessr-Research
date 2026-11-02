@@ -2,6 +2,7 @@
 
 import base64
 import logging
+import math
 import os
 import threading
 import uuid
@@ -9,6 +10,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
+from time import monotonic
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -23,6 +25,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class Session:
     api: StreetViewSession
+    last_used: float
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -49,6 +52,7 @@ def create_app(config=None) -> Flask:
         CACHE_DIR=os.getenv("MAPCRUNCH_CACHE_DIR", "/tmp/mapcrunch_cache"),
         CACHE_SIZE_GB=float(os.getenv("MAPCRUNCH_CACHE_SIZE_GB", "5")),
         CROP_MODE=os.getenv("GEOGUESSR_CROP", "off").strip().lower(),
+        SESSION_IDLE_TIMEOUT=float(os.getenv("SESSION_IDLE_TIMEOUT", "43200")),
     )
     app.config.update(config or {})
     db_path = app.config["DB_PATH"]
@@ -57,6 +61,9 @@ def create_app(config=None) -> Flask:
     crop_mode = app.config["CROP_MODE"]
     if crop_mode not in {"off", "top", "bottom"}:
         raise ValueError("GEOGUESSR_CROP must be off, top, or bottom")
+    idle_timeout = float(app.config["SESSION_IDLE_TIMEOUT"])
+    if not math.isfinite(idle_timeout) or idle_timeout <= 0:
+        raise ValueError("SESSION_IDLE_TIMEOUT must be finite and positive")
     image_store = app.config.get("IMAGE_STORE")
     if image_store is None:
         if not app.config["GCS_BUCKET"]:
@@ -71,6 +78,24 @@ def create_app(config=None) -> Flask:
     sessions = {}
     sessions_lock = threading.Lock()
     app.extensions["street_view_sessions"] = sessions
+
+    def cleanup_idle_sessions():
+        with sessions_lock:
+            candidates = list(sessions.items())
+        for sid, session in candidates:
+            # An in-flight request is active even if it takes longer than the timeout.
+            if not session.lock.acquire(blocking=False):
+                continue
+            try:
+                with sessions_lock:
+                    if sessions.get(sid) is not session:
+                        continue
+                    if monotonic() - session.last_used < idle_timeout:
+                        continue
+                    sessions.pop(sid)
+                session.api.close()
+            finally:
+                session.lock.release()
 
     def ok(updates=None):
         return jsonify({"ok": True, "updates": updates or {}, "error": {}})
@@ -104,11 +129,14 @@ def create_app(config=None) -> Flask:
                 except Exception as error:
                     log.exception("Street View request failed")
                     return fail(str(error), 500)
+                finally:
+                    session.last_used = monotonic()
         return handle
 
     @app.post("/connect")
     def connect():
         # BFCL accepts the returned ID; Google Maps credentials are unnecessary.
+        cleanup_idle_sessions()
         try:
             api = StreetViewSession(db_path, image_store)
         except Exception as error:
@@ -116,7 +144,7 @@ def create_app(config=None) -> Flask:
             return fail(str(error), 500)
         sid = uuid.uuid4().hex
         with sessions_lock:
-            sessions[sid] = Session(api)
+            sessions[sid] = Session(api, last_used=monotonic())
         return ok({"session_id": sid})
 
     @app.post("/init_panorama")

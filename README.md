@@ -35,6 +35,14 @@ variables take precedence. `HOST`, `PORT`, and `SERVER_THREADS` control the
 Waitress server. This service keeps sessions in one process; use threads for
 concurrent BFCL clients.
 
+SQLite connections are opened only for metadata reads and closed before those
+operations return. Paused or abandoned sessions retain navigation state without
+holding a database connection. Each `/connect` also reclaims sessions idle for
+12 hours by default. `SESSION_IDLE_TIMEOUT` configures this timeout in seconds
+(default `43200`). Requests in progress are protected; their idle timer restarts
+when they finish, including when they fail. Cleanup runs on new connections,
+without a background worker or client heartbeat.
+
 For Docker, also set `GOOGLE_APPLICATION_CREDENTIALS` to the absolute path of
 an ADC JSON credential file, then run `docker compose up --build`. Compose
 mounts the database and credentials read-only and stores cached images in a
@@ -55,7 +63,7 @@ Google Maps credentials optionally sent by BFCL are accepted and ignored.
 | POST | `/scroll/<direction>` | `left`, `right`, `up`, `down` with `delta`; returns `available_moves` |
 | POST | `/zoom/<direction>` | `in`, `out` with `delta`; returns `available_moves` |
 | POST | `/capture/view` | Returns raw JPEG base64 in `image_base64` |
-| POST | `/end_session` | Releases the session and its database connection |
+| POST | `/end_session` | Releases the session and clears its navigation state |
 
 Initialization chooses the nearest stored panorama. The existing capture grid
 is preserved: headings every 30 degrees, pitches from -30 to 30 in 15-degree

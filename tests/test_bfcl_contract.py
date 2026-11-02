@@ -218,18 +218,131 @@ def test_capture_crop_preserves_original_image_bytes(server, crop_mode):
     successful(client.post("/end_session", headers=headers, json={}))
 
 
-def test_teardown_closes_sqlite_connection(server):
+def test_teardown_removes_session_and_clears_navigation(server):
     app, _ = server
     client = app.test_client()
     headers = connect(client)
     sid = headers["X-Session-ID"]
     registry = app.extensions["street_view_sessions"]
-    connection = registry[sid].api._conn
-    assert connection.execute("SELECT 1").fetchone()[0] == 1
+    api = registry[sid].api
+    initialize(client, headers)
     successful(client.post("/end_session", headers=headers, json={}))
     assert sid not in registry
-    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-        connection.execute("SELECT 1")
+    assert api.available_moves == []
+    with pytest.raises(RuntimeError, match="No panorama loaded"):
+        api.capture_view()
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    from apps import geoguessr_server_gcs
+
+    now = [1000.0]
+    monkeypatch.setattr(geoguessr_server_gcs, "monotonic", lambda: now[0])
+    return now
+
+
+def test_connect_reclaims_sessions_after_twelve_idle_hours(server, clock, monkeypatch):
+    app, _ = server
+    client = app.test_client()
+    headers = connect(client)
+    sid = headers["X-Session-ID"]
+    registry = app.extensions["street_view_sessions"]
+    session = registry[sid]
+    closed = []
+    original_close = session.api.close
+
+    def close():
+        closed.append(sid)
+        original_close()
+
+    monkeypatch.setattr(session.api, "close", close)
+    assert app.config["SESSION_IDLE_TIMEOUT"] == 12 * 60 * 60
+    clock[0] += 12 * 60 * 60 - 1
+    connect(client)
+    assert sid in registry
+    assert closed == []
+
+    clock[0] += 1
+    connect(client)
+    assert sid not in registry
+    assert closed == [sid]
+    response = client.get("/check/direction", headers=headers)
+    assert response.get_json()["ok"] is False
+    connect(client)
+    assert closed == [sid]
+
+
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_session_activity_extends_idle_timeout(server, clock, capture_fails):
+    app, images = server
+    client = app.test_client()
+    headers = connect(client)
+    initialize(client, headers)
+    sid = headers["X-Session-ID"]
+    timeout = app.config["SESSION_IDLE_TIMEOUT"]
+    clock[0] += timeout - 1
+    images.fail = capture_fails
+    response = client.post("/capture/view", headers=headers, json={})
+    assert response.get_json()["ok"] is not capture_fails
+
+    clock[0] += timeout - 1
+    connect(client)
+    assert sid in app.extensions["street_view_sessions"]
+    clock[0] += 1
+    connect(client)
+    assert sid not in app.extensions["street_view_sessions"]
+
+
+def test_connect_keeps_in_flight_session_and_completion_refreshes_idle_time(
+    server, clock, monkeypatch,
+):
+    app, images = server
+    client = app.test_client()
+    headers = connect(client)
+    initialize(client, headers)
+    sid = headers["X-Session-ID"]
+    timeout = app.config["SESSION_IDLE_TIMEOUT"]
+    entered, release = threading.Event(), threading.Event()
+    responses = []
+
+    def capture():
+        entered.set()
+        assert release.wait(5), "capture was not released"
+        return images.jpeg
+
+    api = app.extensions["street_view_sessions"][sid].api
+    monkeypatch.setattr(api, "capture_view", capture)
+    thread = threading.Thread(target=lambda: responses.append(
+        app.test_client().post("/capture/view", headers=headers, json={})
+    ), daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(5), "capture did not start"
+        clock[0] += timeout + 1
+        connect(client)
+        assert sid in app.extensions["street_view_sessions"]
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(responses) == 1
+    successful(responses[0])
+    clock[0] += timeout - 1
+    connect(client)
+    assert sid in app.extensions["street_view_sessions"]
+    clock[0] += 1
+    connect(client)
+    assert sid not in app.extensions["street_view_sessions"]
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_invalid_session_idle_timeout_is_rejected(server, timeout):
+    from apps.geoguessr_server_gcs import create_app
+
+    app, _ = server
+    with pytest.raises(ValueError, match="SESSION_IDLE_TIMEOUT"):
+        create_app({**app.config, "SESSION_IDLE_TIMEOUT": timeout})
 
 
 def test_same_session_serializes_mutation_capture_and_teardown(server, monkeypatch):
@@ -341,8 +454,8 @@ def test_same_session_serializes_mutation_capture_and_teardown(server, monkeypat
     assert len(responses) == 3
     assert images.calls == [("start", 90.0, 0.0, 1.0)]
     assert sid not in app.extensions["street_view_sessions"]
-    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-        session.api._conn.execute("SELECT 1")
+    with pytest.raises(RuntimeError, match="No panorama loaded"):
+        session.api.capture_view()
 
 
 @pytest.mark.parametrize("path, method", [

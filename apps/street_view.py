@@ -3,6 +3,7 @@
 import json
 import math
 import sqlite3
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 ALLOWED_HEADINGS = tuple(float(value) for value in range(0, 360, 30))
@@ -57,13 +58,16 @@ class StreetViewSession:
     """One navigation session; the HTTP server serializes access to it.
 
     Metadata is read from SQLite and images come from the shared image store.
+    Database connections are closed after each initialization or move.
     Only ``capture_view`` fetches image bytes.
     """
 
     def __init__(self, db_path, image_store):
-        uri = Path(db_path).expanduser().resolve().as_uri() + "?mode=ro"
-        self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        path = Path(db_path).expanduser().resolve()
+        if not path.is_file():
+            raise sqlite3.OperationalError("unable to open database file")
+        self._db_uri = path.as_uri() + "?mode=ro"
+        self._closed = False
         self._image_store = image_store
         self._pano_id = None
         self._heading = 0.0
@@ -72,8 +76,16 @@ class StreetViewSession:
         self._links = []
         self.available_moves = []
 
-    def _load_links(self, pano_id):
-        row = self._conn.execute(
+    @contextmanager
+    def _database(self):
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+        with closing(sqlite3.connect(self._db_uri, uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            yield conn
+
+    def _load_links(self, conn, pano_id):
+        row = conn.execute(
             "SELECT metadata_json FROM panoramas WHERE pano_id = ?", (pano_id,)
         ).fetchone()
         if row and row["metadata_json"]:
@@ -84,14 +96,14 @@ class StreetViewSession:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        rows = self._conn.execute(
+        rows = conn.execute(
             "SELECT to_pano_id, heading FROM panorama_links WHERE from_pano_id = ?",
             (pano_id,),
         ).fetchall()
         return [{"panoId": row["to_pano_id"], "heading": row["heading"]} for row in rows]
 
-    def _set_panorama(self, pano_id):
-        links = self._load_links(pano_id)
+    def _set_panorama(self, conn, pano_id):
+        links = self._load_links(conn, pano_id)
         moves = list(UNIVERSAL_ACTIONS)
         for link in links:
             action = f"move_{_direction(link['heading'])[1]}"
@@ -114,15 +126,16 @@ class StreetViewSession:
         heading = _grid_value(_number(heading, "heading") % 360.0, ALLOWED_HEADINGS, "heading")
         pitch = _grid_value(_number(pitch, "pitch"), ALLOWED_PITCHES, "pitch")
         zoom = _grid_value(_number(zoom, "zoom"), ALLOWED_ZOOMS, "zoom")
-        row = self._conn.execute(
-            "SELECT pano_id FROM panoramas "
-            "WHERE lat IS NOT NULL AND lng IS NOT NULL "
-            "ORDER BY (lat - ?) * (lat - ?) + (lng - ?) * (lng - ?) LIMIT 1",
-            (lat, lat, lng, lng),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("No panoramas in local database")
-        self._set_panorama(row["pano_id"])
+        with self._database() as conn:
+            row = conn.execute(
+                "SELECT pano_id FROM panoramas "
+                "WHERE lat IS NOT NULL AND lng IS NOT NULL "
+                "ORDER BY (lat - ?) * (lat - ?) + (lng - ?) * (lng - ?) LIMIT 1",
+                (lat, lat, lng, lng),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("No panoramas in local database")
+            self._set_panorama(conn, row["pano_id"])
         self._heading, self._pitch, self._zoom = heading, pitch, zoom
         return self._updates()
 
@@ -144,11 +157,12 @@ class StreetViewSession:
         if target is None:
             raise RuntimeError(f"No moves available in {direction} direction")
         pano_id = target["panoId"]
-        if self._conn.execute(
-            "SELECT 1 FROM panoramas WHERE pano_id = ?", (pano_id,)
-        ).fetchone() is None:
-            raise RuntimeError(f"Target panorama {pano_id} not found in local database")
-        self._set_panorama(pano_id)
+        with self._database() as conn:
+            if conn.execute(
+                "SELECT 1 FROM panoramas WHERE pano_id = ?", (pano_id,)
+            ).fetchone() is None:
+                raise RuntimeError(f"Target panorama {pano_id} not found in local database")
+            self._set_panorama(conn, pano_id)
         return self._updates()
 
     def scroll(self, direction, delta):
@@ -182,7 +196,7 @@ class StreetViewSession:
         return self._image_store.get(self._pano_id, self._heading, self._pitch, self._zoom)
 
     def close(self):
-        self._conn.close()
+        self._closed = True
         self._pano_id = None
         self._links = []
         self.available_moves = []

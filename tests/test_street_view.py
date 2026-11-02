@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -20,7 +21,7 @@ class ImageStore:
 @pytest.fixture
 def database(tmp_path):
     path = tmp_path / "panoramas.db"
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         conn.executescript(
             "CREATE TABLE panoramas (pano_id TEXT PRIMARY KEY, lat REAL, lng REAL, metadata_json TEXT);"
             "CREATE TABLE panorama_links (from_pano_id TEXT, to_pano_id TEXT, heading REAL);"
@@ -44,6 +45,7 @@ def database(tmp_path):
             "INSERT INTO panorama_links VALUES (?, ?, ?)",
             [("start", "duplicate", 180), ("north", "start", 180)],
         )
+        conn.commit()
     return path
 
 
@@ -52,6 +54,27 @@ def session(database):
     session = StreetViewSession(database, ImageStore())
     yield session
     session.close()
+
+
+@pytest.fixture
+def recorded_connections(database, monkeypatch):
+    connect = sqlite3.connect
+    connections = []
+
+    def record(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", record)
+    return connections
+
+
+def assert_connections_closed(connections):
+    assert connections
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
 
 
 def test_nearest_string_coordinates_and_metadata_take_precedence(session):
@@ -141,15 +164,97 @@ def test_invalid_scenario_does_not_partially_change_state(session, kwargs):
     assert session._image_store.requests[-1][0] == "start"
 
 
-def test_session_requires_initialization_and_closes_database(session):
+def test_session_requires_initialization_and_close_clears_state(session):
     with pytest.raises(RuntimeError, match="No panorama loaded"):
         session.capture_view()
     session.init_panorama(1, 2)
-    with pytest.raises(sqlite3.OperationalError, match="readonly"):
-        session._conn.execute("DELETE FROM panoramas")
     session.close()
+    assert session.available_moves == []
+    with pytest.raises(RuntimeError, match="No panorama loaded"):
+        session.capture_view()
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-        session._conn.execute("SELECT 1")
+        session.init_panorama(1, 2)
+
+
+def test_only_metadata_operations_open_connections_and_close_them(
+    database, recorded_connections,
+):
+    session = StreetViewSession(database, ImageStore())
+    assert recorded_connections == []
+
+    session.init_panorama(1, 2)
+    assert len(recorded_connections) == 1
+    assert_connections_closed(recorded_connections)
+
+    session.scroll("right", 30)
+    session.zoom("in", 1)
+    assert session.check_direction()["description"] == "Facing NE (30.0 degrees)"
+    session.capture_view()
+    assert session._image_store.requests[-1] == ("start", 30.0, 0.0, 2.0)
+    assert len(recorded_connections) == 1
+
+    session.move("north")
+    assert session.available_moves[-1] == "move_south"
+    assert len(recorded_connections) == 2
+    assert_connections_closed(recorded_connections)
+    session.capture_view()
+    assert session._image_store.requests[-1] == ("north", 30.0, 0.0, 2.0)
+
+    with pytest.raises(RuntimeError, match="No moves available"):
+        session.move("east")
+    assert len(recorded_connections) == 2
+    session.close()
+    assert_connections_closed(recorded_connections)
+
+
+def test_missing_move_target_closes_connection_and_preserves_view(
+    session, recorded_connections,
+):
+    session.init_panorama(1, 2)
+    with pytest.raises(RuntimeError, match="not found"):
+        session.move("east")
+    assert len(recorded_connections) == 2
+    assert_connections_closed(recorded_connections)
+    session.capture_view()
+    assert session._image_store.requests[-1][0] == "start"
+
+
+@pytest.mark.parametrize(
+    "setup,error,match",
+    [
+        ("DELETE FROM panoramas", RuntimeError, "No panoramas"),
+        ("DROP TABLE panoramas", sqlite3.OperationalError, "no such table"),
+        (
+            "UPDATE panoramas SET metadata_json = '{\"links\": [{\"panoId\": \"north\"}]}'",
+            KeyError,
+            "heading",
+        ),
+    ],
+)
+def test_initialization_failures_close_metadata_connections(
+    database, recorded_connections, setup, error, match,
+):
+    with closing(sqlite3.connect(database)) as conn:
+        conn.execute(setup)
+        conn.commit()
+    recorded_connections.clear()
+
+    session = StreetViewSession(database, ImageStore())
+    with pytest.raises(error, match=match):
+        session.init_panorama(1, 2)
+    assert len(recorded_connections) == 1
+    assert_connections_closed(recorded_connections)
+
+
+def test_metadata_connections_are_read_only_and_close_after_write_failure(
+    session, recorded_connections,
+):
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        with session._database() as conn:
+            conn.execute("DELETE FROM panoramas")
+    assert_connections_closed(recorded_connections)
+    session.init_panorama(1, 2)
+    assert_connections_closed(recorded_connections)
 
 
 def test_nonexistent_database_is_not_created(tmp_path):

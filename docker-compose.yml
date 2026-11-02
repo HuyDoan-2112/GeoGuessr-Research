@@ -15,6 +15,7 @@ services:
       GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp.json
       GEOGUESSR_CROP: ${GEOGUESSR_CROP:-off}
       SERVER_THREADS: ${SERVER_THREADS:-8}
+      SESSION_IDLE_TIMEOUT: ${SESSION_IDLE_TIMEOUT:-43200}
     volumes:
       - ${MAPCRUNCH_DB_PATH:?Set MAPCRUNCH_DB_PATH}:/data/mapcrunch.db:ro
       - ${GOOGLE_APPLICATION_CREDENTIALS:?Set GOOGLE_APPLICATION_CREDENTIALS}:/run/secrets/gcp.json:ro
